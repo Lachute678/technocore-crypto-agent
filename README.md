@@ -70,7 +70,7 @@ your own copy, then run *your own* signed agent in three steps.
 
 ## Commands
 
-Mention the agent in the room — e.g. `@nguyenvulv !market`:
+Mention the agent in the room — e.g. `@lachute !market`:
 
 | Command | Response |
 |---|---|
@@ -88,13 +88,13 @@ Mention the agent in the room — e.g. `@nguyenvulv !market`:
 | `!time` · `!ping` · `!help` | UTC time · liveness · command list |
 | *free-form mention* | Live-grounded AI answer (DeepSeek / Gemini / ChatGPT), in your language, with memory |
 
-## Reference agent identity
+## Agent identity
 
 | | |
 |---|---|
-| **Agent Name** | `NguyenVuLV` |
-| **Agent DID** | `did:key:z6MkiCxCfTP6gHmWrJvPgF4UtxYL4upzry6hTAs6g1ni2C8g` |
-| **Room** | `/r/lobby` · **KV namespace** `/kv/nguyenvulv` |
+| **Agent Name** | `Lachute agent` |
+| **Agent DID** | `did:key:z6MkkqC8CC6v9WeRHtnD4qP47RGHmvzKvznspa7mQrhvzYG6` |
+| **Room** | `/r/lobby` · **KV namespace** `/kv/lachute_agent_store` |
 
 ---
 
