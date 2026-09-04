@@ -9,6 +9,7 @@ ngôn ngữ/coin/tone, bộ nhớ hội thoại, và lớp mạng (post/fetch/kv
 """
 
 import base64
+import json
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -222,6 +223,162 @@ def test_mem_get_empty():
     assert ac.mem_get({}, "") == []
 
 
+def test_llm_reply_memory_keyed_by_did_not_nick(monkeypatch):
+    """Trí nhớ phải khóa theo DID đã verify: hai peer TRÙNG nick hiển thị vẫn có
+    bộ nhớ RIÊNG (nick giả mạo/tái dùng được, DID thì không)."""
+    monkeypatch.setattr(ac, "_active_provider", lambda: True)
+    monkeypatch.setattr(ac, "_provider_reply", lambda p, s, t, *a, **k: ("answer", "stub"))
+    monkeypatch.setattr(ac, "build_market_context", lambda coins, *a, **k: "")
+    state = {}
+    did_a, did_b = "did:key:zAAA", "did:key:zBBB"
+    ac.llm_reply("hi from A", sender_nick="dupnick", state=state, mem_key=did_a)
+    ac.llm_reply("hi from B", sender_nick="dupnick", state=state, mem_key=did_b)
+    assert list(state["mem"].keys()) == [did_a, did_b]      # tách theo DID, không gộp theo nick
+    assert len(state["mem"][did_a]) == 1
+    assert len(state["mem"][did_b]) == 1
+
+
+def test_llm_reply_memory_falls_back_to_nick_without_did(monkeypatch):
+    """Không có DID (input tay / non-peer) -> lùi về nick làm khóa, vẫn nhớ được."""
+    monkeypatch.setattr(ac, "_active_provider", lambda: True)
+    monkeypatch.setattr(ac, "_provider_reply", lambda p, s, t, *a, **k: ("answer", "stub"))
+    monkeypatch.setattr(ac, "build_market_context", lambda coins, *a, **k: "")
+    state = {}
+    ac.llm_reply("hello", sender_nick="friend", state=state, mem_key=None)
+    assert "friend" in state["mem"]
+
+
+# --- Hồ sơ peer có cấu trúc (#3) --------------------------------------------------
+
+def test_prof_update_captures_lang_and_coins():
+    state = {}
+    ac.prof_update(state, "did:key:zX", "giá ETH và BTC thế nào?")
+    p = state["prof"]["did:key:zX"]
+    assert p["lang"] == "vi"
+    assert p["coins"][:2] == ["ETH", "BTC"]                 # coin mới nhất đứng trước
+    assert p["seen"] == 1
+
+
+def test_prof_update_caps_coins_and_dedupes():
+    state = {}
+    for msg in ("price btc", "price eth", "price sol", "price bnb"):
+        ac.prof_update(state, "did:key:zX", msg)
+    coins = state["prof"]["did:key:zX"]["coins"]
+    assert len(coins) == ac.PROFILE_MAX_COINS               # giữ tối đa N coin gần nhất
+    assert coins[0] == "BNB" and "BTC" not in coins         # cũ nhất bị đẩy ra
+
+
+def test_prof_line_renders_context_or_empty():
+    assert ac.prof_line({}, "did:key:zX") == ""            # chưa biết gì
+    state = {}
+    ac.prof_update(state, "did:key:zX", "eth price?")
+    line = ac.prof_line(state, "did:key:zX")
+    assert "lang=en" in line and "ETH" in line
+
+
+# --- Chống đăng trùng (#7) --------------------------------------------------------
+
+def test_dedup_blocks_same_text_same_peer_within_window():
+    state = {}
+    now = 1_000_000
+    who = "did:key:zPEER"
+    assert ac.is_dup_out(state, "@zPEER hi", now, who) is False
+    ac.note_out(state, "@zPEER hi", now, who)
+    assert ac.is_dup_out(state, "@zPEER hi", now + 5, who) is True       # trùng đúng peer
+
+
+def test_dedup_ignores_same_text_different_peer():
+    state = {}
+    now = 1_000_000
+    ac.note_out(state, "ok", now, "did:key:zA")
+    assert ac.is_dup_out(state, "ok", now, "did:key:zB") is False        # peer khác -> không trùng
+
+
+def test_dedup_expires_after_window():
+    state = {}
+    now = 1_000_000
+    who = "did:key:zPEER"
+    ac.note_out(state, "hi", now, who)
+    assert ac.is_dup_out(state, "hi", now + ac.DEDUP_WINDOW_S + 1, who) is False  # hết hạn
+
+
+# --- Giao thức agent-to-agent (#5) ------------------------------------------------
+
+def _mention(rest):
+    return f"{ac.HANDLE} {rest}"
+
+
+def test_a2a_price_returns_machine_line(monkeypatch):
+    monkeypatch.setattr(ac, "get_market", lambda ids: {ids[0]: {"usd": 2522.0, "chg": 2.4}})
+    out = ac.a2a_reply(_mention("price eth"), "bob")
+    assert "ok price ETH 2522.0 (+2.4% 24h)" in out
+    assert "src=coingecko/binance" in out and "| t=" in out
+
+
+def test_a2a_price_unknown_coin(monkeypatch):
+    out = ac.a2a_reply(_mention("price notacoin"), "bob")
+    assert "err unknown-coin" in out
+
+
+def test_a2a_fear(monkeypatch):
+    monkeypatch.setattr(ac, "get_fear_greed", lambda: (33, "Fear"))
+    out = ac.a2a_reply(_mention("fear"), "bob")
+    assert "ok fear 33/100 Fear" in out
+
+
+def test_a2a_help_and_about():
+    h = ac.a2a_reply(_mention("help"), "bob")
+    assert "ok help verbs=" in h and "price" in h and "market" in h and "gas" in h
+    ab = ac.a2a_reply(_mention("about"), "bob")
+    assert "ok about" in ab and ac.REPO_URL in ab
+
+
+def test_a2a_market_top_dominance_gas(monkeypatch):
+    monkeypatch.setattr(ac, "get_market",
+                        lambda ids: {i: {"usd": 100.0, "chg": 1.0} for i in ids})
+    monkeypatch.setattr(ac, "get_top_movers", lambda n=3: [("AAA", 9.1), ("BBB", 4.2)])
+    monkeypatch.setattr(ac, "get_dominance", lambda: (54.3, 17.1))
+    monkeypatch.setattr(ac, "get_eth_gas", lambda: 12.5)
+    assert "ok market BTC 100.0" in ac.a2a_reply(_mention("market"), "bob")
+    assert "ok top AAA +9.1%" in ac.a2a_reply(_mention("top"), "bob")
+    assert "ok dominance btc=54.3% eth=17.1%" in ac.a2a_reply(_mention("dominance"), "bob")
+    assert "ok gas 12.5gwei" in ac.a2a_reply(_mention("gas"), "bob")
+
+
+def test_a2a_gas_feed_offline(monkeypatch):
+    monkeypatch.setattr(ac, "get_eth_gas", lambda: None)
+    assert "err feed-offline gas" in ac.a2a_reply(_mention("gas"), "bob")
+
+
+def test_a2a_price_new_coin(monkeypatch):
+    # coin mới thêm (vd SUI) phải resolve được qua COIN_IDS mở rộng.
+    assert ac.COIN_IDS.get("sui") == "sui"
+    monkeypatch.setattr(ac, "get_market", lambda ids: {ids[0]: {"usd": 3.14, "chg": -1.2}})
+    assert "ok price SUI 3.14" in ac.a2a_reply(_mention("price sui"), "bob")
+
+
+def test_expanded_coin_ids_have_binance_fallback():
+    # Mọi coin mới nên có cặp Binance dự phòng (trừ alias tên đầy đủ trùng id gốc).
+    for sym in ("ltc", "uni", "sui", "arb", "op", "aave", "tia", "mkr"):
+        cid = ac.COIN_IDS[sym]
+        assert cid in ac.BINANCE_SYMBOLS, f"{sym} ({cid}) thiếu Binance fallback"
+
+
+def test_a2a_natural_language_is_not_a2a():
+    # Câu dài (nhiều token) -> KHÔNG phải A2A, để rơi xuống LLM cho người.
+    assert ac.a2a_reply(_mention("price of eth please?"), "bob") is None
+
+
+def test_a2a_ignores_human_bang_command():
+    # "!price" là lệnh người -> A2A trả None, để luồng !command xử lý.
+    assert ac.a2a_reply(_mention("!price eth"), "bob") is None
+
+
+def test_a2a_read_only_no_state_write(monkeypatch):
+    # Giao thức A2A CHỈ-ĐỌC: verb lạ (vd 'remember') KHÔNG được nhận -> None (không ghi state).
+    assert ac.a2a_reply(_mention("remember BTC watch"), "bob") is None
+
+
 # --- Lớp mạng (requests giả) -----------------------------------------------------
 
 def test_post_message_signs_canonical_and_posts(pk, monkeypatch):
@@ -257,6 +414,30 @@ def test_post_message_returns_false_on_network_error(pk, monkeypatch):
         raise ac.requests.RequestException("down")
     monkeypatch.setattr(ac.requests, "post", boom)
     assert ac.post_message(pk, ac.did_of(pk), "hi") is False
+
+
+# --- Health-guard: bắt outage ĐƯỜNG GHI (server đọc được nhưng POST 503) -----------------
+def test_posts_degraded_write_path_health(monkeypatch):
+    monkeypatch.setattr(ac, "_post_ok_count", 0)
+    monkeypatch.setattr(ac, "_post_fail_count", 0)
+    assert ac.posts_degraded() is False        # chưa thử post nào -> chưa kết luận sập
+    ac._note_post(False)
+    assert ac.posts_degraded() is True         # đã thử, toàn fail -> đường ghi sập
+    ac._note_post(True)
+    assert ac.posts_degraded() is False         # có 1 POST 200 -> còn sống, không chặn nhầm
+
+
+def test_post_message_503_marks_write_degraded(pk, monkeypatch):
+    monkeypatch.setattr(ac, "_post_ok_count", 0)
+    monkeypatch.setattr(ac, "_post_fail_count", 0)
+    monkeypatch.setattr(ac.requests, "post", lambda url, json=None, **k: _Resp(status=503))
+    assert ac.post_message(pk, ac.did_of(pk), "hi") is False
+    assert ac.posts_degraded() is True         # 503 tính là fail ghi
+    def boom(*a, **k):
+        raise ac.requests.RequestException("down")
+    monkeypatch.setattr(ac.requests, "post", boom)
+    ac.post_message(pk, ac.did_of(pk), "hi2")
+    assert ac._post_fail_count == 2            # cả exception cũng tính fail
 
 
 def test_fetch_messages_returns_json(monkeypatch):
@@ -480,8 +661,8 @@ def _stub_market(monkeypatch, provider="gemini", reply="Risk-on: BTC steady, F&G
     monkeypatch.setattr(ac, "get_dominance", lambda: (52.0, 17.0))
     monkeypatch.setattr(ac, "get_trending", lambda n=5: ["aaa", "bbb"])
     monkeypatch.setattr(ac, "_provider_chain", lambda: [] if provider is None else [provider])
-    monkeypatch.setattr(ac, "_gemini_reply", lambda p, s, t: reply)
-    monkeypatch.setattr(ac, "_openai_reply", lambda p, s, t: reply)
+    monkeypatch.setattr(ac, "_gemini_reply", lambda p, s, t, *a, **k: reply)
+    monkeypatch.setattr(ac, "_openai_reply", lambda p, s, t, *a, **k: reply)
 
 
 def test_build_digest_context_includes_movers_and_dominance(monkeypatch):
@@ -675,7 +856,7 @@ def test_explain_move_on_grounds_on_moves_and_fg(monkeypatch):
     monkeypatch.setattr(ac, "ALERT_EXPLAIN_ENABLED", True)
     seen = {}
 
-    def cap(p, s, t):
+    def cap(p, s, t, *a, **k):
         seen["p"] = p
         return "Sharp momentum spike amid greedy sentiment."
 
@@ -795,3 +976,133 @@ def test_deepseek_reply_hits_deepseek_endpoint(monkeypatch):
     assert ac._deepseek_reply("hi", "sys", 0.5) == "ok"
     assert seen["url"] == "https://api.deepseek.com/chat/completions"
     assert seen["auth"] == "Bearer dk" and seen["model"] == "deepseek-chat"
+
+
+# --- Runner coordination (tùy chọn 1 chính + 1 phụ) via KV heartbeat ---------------
+def test_primary_alive_fresh_heartbeat(monkeypatch):
+    now = 1_000_000
+    monkeypatch.setattr(ac, "kv_get", lambda k: str(now - 600))   # 10 phút trước
+    assert ac.primary_alive(now, within_min=45) is True
+
+
+def test_primary_alive_stale_heartbeat(monkeypatch):
+    now = 1_000_000
+    monkeypatch.setattr(ac, "kv_get", lambda k: str(now - 3600))  # 60 phút trước
+    assert ac.primary_alive(now, within_min=45) is False
+
+
+def test_primary_alive_missing_or_bad_heartbeat_means_dead(monkeypatch):
+    now = 1_000_000
+    monkeypatch.setattr(ac, "kv_get", lambda k: None)
+    assert ac.primary_alive(now, within_min=45) is False         # phụ tiếp quản (fail-open)
+    monkeypatch.setattr(ac, "kv_get", lambda k: "not-an-int")
+    assert ac.primary_alive(now, within_min=45) is False
+
+
+def test_hydrate_durable_takes_max_timestamp(monkeypatch):
+    # local đã có mốc mới hơn KV -> giữ local (không lùi mốc, tránh re-post).
+    remote = {"last_telemetry": 100, "last_seq": 5}
+    monkeypatch.setattr(ac, "kv_get", lambda k: json.dumps(remote))
+    state = {"last_telemetry": 500, "last_seq": 2}
+    ac.hydrate_durable_from_kv(state)
+    assert state["last_telemetry"] == 500          # local mới hơn -> giữ
+    assert state["last_seq"] == 5                  # KV mới hơn -> lấy KV
+
+
+def test_hydrate_durable_fills_empty_local_from_kv(monkeypatch):
+    # Runner mới / cache mất: local rỗng -> lấy hết mốc từ KV để KHÔNG re-post telemetry.
+    remote = {"last_telemetry": 900, "last_manifest": 800, "weekly_samples": [{"p": 1}]}
+    monkeypatch.setattr(ac, "kv_get", lambda k: json.dumps(remote))
+    state = {}
+    ac.hydrate_durable_from_kv(state)
+    assert state["last_telemetry"] == 900 and state["last_manifest"] == 800
+    assert state["weekly_samples"] == [{"p": 1}]
+
+
+def test_hydrate_durable_noop_on_missing_or_bad_kv(monkeypatch):
+    monkeypatch.setattr(ac, "kv_get", lambda k: None)
+    state = {"last_telemetry": 7}
+    ac.hydrate_durable_from_kv(state)
+    assert state == {"last_telemetry": 7}
+    monkeypatch.setattr(ac, "kv_get", lambda k: "{not json")
+    ac.hydrate_durable_from_kv(state)
+    assert state == {"last_telemetry": 7}
+
+
+def test_persist_durable_writes_only_durable_subset(monkeypatch):
+    snap = {"last_telemetry": 111, "last_seq": 9, "weekly_samples": [1, 2],
+            "mem": {"bob": "secret"}, "kibble_cursor": 42}
+    monkeypatch.setattr(ac, "load_state", lambda: snap)
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set",
+                        lambda pk, did, key, val: sent.update({"key": key, "val": val}) or True)
+    ac.persist_durable_to_kv("pk", "did")
+    payload = json.loads(sent["val"])
+    assert sent["key"] == "state"
+    assert payload["last_telemetry"] == 111 and payload["last_seq"] == 9
+    assert payload["weekly_samples"] == [1, 2]
+    assert "mem" not in payload and "kibble_cursor" not in payload   # không mirror bừa
+
+
+def test_main_backup_stands_down_when_primary_alive(monkeypatch):
+    # Thuộc tính an toàn cốt lõi: phụ KHÔNG đăng telemetry / KHÔNG auto_respond khi chính sống.
+    monkeypatch.setattr(ac, "SEED_HEX", SEED_HEX)
+    monkeypatch.setattr(ac, "RUNNER_ROLE", "backup")
+    monkeypatch.setattr(ac, "load_state", lambda: {"last_seq": 3})
+    monkeypatch.setattr(ac, "hydrate_durable_from_kv", lambda s: None)
+    monkeypatch.setattr(ac, "primary_alive", lambda now, m: True)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    saved = {}
+    monkeypatch.setattr(ac, "save_state", lambda d: saved.update(d))
+    hit = {}
+    monkeypatch.setattr(ac, "broadcast_telemetry",
+                        lambda *a, **k: hit.setdefault("tele", True))
+    monkeypatch.setattr(ac, "auto_respond",
+                        lambda *a, **k: hit.update(resp=True) or (0, 0))
+    ac.main()
+    assert "tele" not in hit and "resp" not in hit   # đứng im hoàn toàn
+    assert saved.get("last_seq") == 3                # nhưng vẫn giữ cursor để sẵn sàng tiếp quản
+
+
+def test_main_backup_runs_when_forced_even_if_primary_alive(monkeypatch):
+    # Chạy tay (workflow_dispatch) BỎ QUA standby để còn test được -> auto_respond phải chạy.
+    monkeypatch.setattr(ac, "SEED_HEX", SEED_HEX)
+    monkeypatch.setattr(ac, "RUNNER_ROLE", "backup")
+    monkeypatch.setattr(ac, "load_state", lambda: {})
+    monkeypatch.setattr(ac, "hydrate_durable_from_kv", lambda s: None)
+    monkeypatch.setattr(ac, "primary_alive", lambda now, m: True)
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setattr(ac, "write_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "persist_durable_to_kv", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_write_summary", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "broadcast_telemetry", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "broadcast_manifest", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "check_price_alert", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_server_ok_count", 1)
+    hit = {}
+    monkeypatch.setattr(ac, "auto_respond",
+                        lambda *a, **k: hit.update(resp=True) or (0, 0))
+    ac.main()
+    assert hit.get("resp") is True                   # force -> KHÔNG standby, chạy đầy đủ
+
+
+def test_is_refusal_detects_declines_not_legit_answers():
+    # từ chối -> True
+    assert ac._is_refusal("I cannot comply with this request.")
+    assert ac._is_refusal("I'm sorry, but I cannot help with that.")
+    assert ac._is_refusal("As an AI, I can't do this.")
+    assert ac._is_refusal('"I cannot provide that."')          # có nháy/ký tự mở đầu
+    # deliverable hợp lệ -> False (không chặn nhầm)
+    assert not ac._is_refusal("SHA-256 always outputs 256 bits regardless of input size.")
+    assert not ac._is_refusal("I cannot stress enough how collision resistance matters here.")
+    assert not ac._is_refusal("")
+
+
+def test_answer_kibble_job_skips_on_refusal(monkeypatch):
+    monkeypatch.setattr(ac, "_active_provider", lambda: True)
+    monkeypatch.setattr(ac, "_provider_reply",
+                        lambda p, s, t, *a, **k: ("I cannot comply with this request.", "stub"))
+    monkeypatch.setattr(ac, "_meter_flop", lambda *a, **k: None)
+    out = ac.answer_kibble_job({"type": "explain", "title": "T", "body": "do X", "jobid": "j1"})
+    assert out is None                                          # từ chối -> KHÔNG deliver

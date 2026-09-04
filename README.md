@@ -561,6 +561,45 @@ python -m pytest test_flop_unlock.py test_flop_pacer.py test_flop_faucet.py -q
 
 ---
 
+## Buying compute: inference sessions & stake delegation (scaffold)
+
+Per the FLOP agent spec (`intro.flop.network/agent.html`), the airdrop rewards **only** two
+things: **(a) inference spend** (pay FLOP to a miner to run inference — every 3 FLOP unlocks 1
+airdropped FLOP) and **(b) stake delegation** (delegate FLOP to a miner/validator for a reward).
+Chat/telemetry do **not** earn — they're for presence, not the airdrop. Two gated, default-OFF
+modules scaffold both paths so the agent can flip on the day FLOP's testnet opens.
+
+**[`flop_session.py`](flop_session.py) — inference sessions (primary path, 3:1).** Models the
+5-field **session request** (model-weight hash · max latency · FLOPs · security flags · fee),
+posts it to a mempool, receives **PoUI (Proof of Useful Inference)**, verifies the proof, and
+**settles** through `token_manager.spend()` — so a settled session on testnet accrues the 3:1
+unlock automatically. `run_inference_session(...)` runs the whole loop; a bad proof routes to
+`dispute()` (no payment) instead of `settle()`. In simulation a mock miner returns a mock PoUI so
+the happy path runs offline; simulation spend does **not** accrue unlock (only real spend does).
+
+> **Honest scope:** `verify_poui()` checks linkage + presence (proof is bound to the session, has
+> a commitment + miner signature), **not** the cryptographic soundness of the activation
+> commitment — that needs FLOP's published spec. Real buying needs `TESTNET_ENABLED=true` +
+> `FLOP_MEMPOOL_URL` + an injected `submit_fn`/`submit_tx`. Gate: `FLOP_SESSION_ENABLED`.
+
+**[`flop_stake.py`](flop_stake.py) — stake delegation (secondary path).** `delegate()` /
+`undelegate()` move FLOP between the liquid balance and a per-validator delegated position on the
+same `token_ledger.json`; `record_reward()` books a stake reward only from a **real** on-chain
+event (no invented reward rate — FLOP hasn't published one). Testnet delegation goes through
+`FLOP_STAKE_URL` + an injected `submit_fn` (missing ⇒ `skipped_unconfigured`, never a fabricated
+tx). Gate: `FLOP_STAKE_ENABLED`; agent entry point `maybe_delegate()`.
+
+Both are **preparation** — they earn nothing until FLOP's testnet is live; then you wire the real
+endpoints and flip `TESTNET_ENABLED=true`. Try them offline:
+
+```bash
+python flop_session.py
+python flop_stake.py
+python -m pytest test_flop_session.py test_flop_stake.py -q
+```
+
+---
+
 ## Running 24/7 on GitHub Actions
 
 The included workflow [`.github/workflows/agent_cron.yml`](.github/workflows/agent_cron.yml) runs the
@@ -570,7 +609,24 @@ agent every 30 minutes and on demand:
 2. Keep the repo **public** for auditability; enable Actions.
 3. `Actions → Technocore Agent Automation → Run workflow` — the **ask** input posts an AI reply instantly.
 
-State persists across runs via `actions/cache` (`state.json`) **and** the KV `cursor`.
+State persists across runs via `actions/cache` (`state.json`) **and** the KV store: the message
+`cursor` plus the broadcast cooldown timers (`last_telemetry`/`last_manifest`/`last_digest`/
+`last_recap`) are mirrored to KV (`hydrate_durable_from_kv` / `persist_durable_to_kv`) and
+re-hydrated at startup, so even if the Actions cache is evicted the agent won't re-post.
+
+### Optional: adding a second runner (hot standby)
+
+The workflow runs as `RUNNER_ROLE=primary` (the single runner). If you ever add a second runner
+(e.g. an always-on VM), the agent already supports a no-double-post handoff via a KV **heartbeat**:
+
+- The **primary** (`RUNNER_ROLE=primary`) stamps a `heartbeat` timestamp on KV every run.
+- A **backup** (`RUNNER_ROLE=backup`) **stands down** while that heartbeat is fresh
+  (`BACKUP_STANDBY_MINUTES`, default 45) and only runs a full cycle when it goes stale (primary
+  down). A manual `workflow_dispatch` bypasses standby for testing.
+
+Set repo Variable `RUNNER_ROLE=backup` on whichever runner should be the standby. The scheme is
+clean for exactly **one primary + one backup**; a third concurrent runner would need a KV
+lease/lock.
 
 ---
 

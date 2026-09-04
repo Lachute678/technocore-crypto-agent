@@ -8,6 +8,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **tclk payee: text-only job filter at accept time.** The payee now reads an offer's job spec
+  (`job.context`) before accepting and **skips jobs that need media** (video/image — a text LLM
+  can't genuinely deliver them), instead of accepting and only bailing later via the completion
+  SKIP. `is_media_job()` is a keyword classifier (video/mp4/reel/9:16/image/photo/tiktok/… — strong
+  media signals, so text jobs like "post or article" are untouched); `run_tclk_payee` takes a
+  `job_spec_fn` to fetch the spec, and `agent_cron` wires it to `tclk_job_spec` (shared with the
+  completion worker). Validated on the live board (19 text / 1 media correctly split). Keeps the
+  agent to work it can genuinely fulfil — no bad-faith accepts. Adds 3 tests.
+- **tclk/1 payee completion loop (accept → lock → work → reveal), gated + dry-run.** Extends
+  `flop_tclk.py` so an accepted deal can be carried to done: derive the deal room
+  (`mb-p-tclk-<contract16>`), watch for the payer's `lock` frame, **verify the lock on the paper
+  rail** (`tclk-paper-<..>` note decoded and matched on lock/statement/refundAfterMs), do the work
+  via the LLM (the job spec at `job.context`, through the same isolate/guard/SKIP layer as kibble),
+  post the deliverable, then `reveal` the preimage — the claim. Every step is a hard gate: no
+  payer lock, no rail confirmation, past the claim window, or no deliverable → **it does not
+  reveal**. Deal-room/paper-note/state-note derivations are a byte-exact port of the reference and
+  were verified against live deals on the venue. Gated `FLOP_TCLK_COMPLETE_ENABLED` (default OFF),
+  `FLOP_TCLK_COMPLETE_DRY_RUN` (default ON → logs `would DELIVER + REVEAL`, posts nothing); shares
+  the write-outage health-guard. The payee still ships no `lock` builder (it never escrows). Alpha/
+  testnet/unaudited — paper rail holds no value. Adds 10 tests (34 total in `flop_tclk`).
+- **tclk/1 payee (deal-making), DRY-RUN by default.** New `flop_tclk.py` speaks the [tclk/1]
+  (github.com/flop-labs/tclk) HTLC/PTLC convention as the **payee**: it discovers valid offers on
+  `/r/tclk-offers` (sender is payer, hash-lock, a rail we accept, within deadline), mints a
+  preimage, and builds a spec-correct `accept` frame (statement = `sha256(preimage)`, contract id
+  over canonical `{offer, accept}`). The canonical-JSON + ASCII-escape + domain-hash are a
+  byte-exact port of the reference `src/frames.ts` — verified against 50 live JS-generated offer
+  ids, and pinned by a real-offer test vector. Gated `FLOP_TCLK_ENABLED` (default OFF); when on it
+  starts **DRY-RUN** (`FLOP_TCLK_DRY_RUN=off` to go live) which only logs `would ACCEPT`, posts
+  nothing, and stores no secret. **Safety by construction: the module only discovers + accepts — it
+  ships no `lock`/`reveal` builder at all**, so it can never auto-claim funds; revealing (the claim)
+  stays a human step. Shares the kibble write-outage health-guard. Alpha/testnet/unaudited per the
+  spec — no real value. Adds `flop_tclk` + 11 tests.
+- **Kibble health-guard: skip the worker when the write-path is down.** technocore.chat can keep
+  serving reads (GET 200) while rejecting writes (POST 503 / read-timeout). In that state the
+  kibble worker used to spend real DeepSeek inference answering a job, then fail to DELIVER (503)
+  and log a hanging FLOP spend for work that never landed. A per-run POST-health counter
+  (`posts_degraded()` — true only when every POST attempted this run failed) now gates the worker:
+  during a write outage it is skipped entirely (`kibble=skip-outage`), so no inference is wasted
+  and the kibble cursor doesn't advance, leaving the jobs to be picked up once the server recovers.
+  A single successful POST clears the guard, so a transient blip won't trip it.
+- **Wider market coverage: 41 coins + 9 A2A verbs.** The coin table grew from 15 to 41 tickers
+  (added LTC, BCH, UNI, SHIB, PEPE, WBTC, SUI, APT, ARB, OP, INJ, LDO, AAVE, FIL, ETC, FTM, ALGO,
+  HBAR, VET, ICP, STX, SEI, TIA, RUNE, GRT, MKR — each with a Binance fallback pair; all 41
+  CoinGecko ids verified to resolve live), so `!price <coin>` and the A2A `price` verb answer far
+  more assets and live-grounding picks them up in free-form replies. The agent-to-agent protocol
+  gained `market`, `top`, `trending`, `dominance`, `gas` verbs (was just `price|fear|help|about`),
+  each returning a parseable line — so another agent can pull the same data the human `!commands`
+  expose. The verb list is centralised so `help`, `about`, and `!help` stay in sync.
+- **Agent-to-agent (A2A) message protocol.** Other agents can now "call the agent like an API"
+  with a terse, machine-readable command — `@handle price eth` / `fear` / `help` / `about` (no
+  `!`, verb + at most one arg) — and get back a single parseable line
+  (`[NguyenVuLV] @caller ok price ETH 2522.0 (+2.4% 24h) | src=coingecko/binance | t=<iso>`, or
+  `err <reason>`). Anything chattier falls through to the normal live-grounded LLM reply, and human
+  `!price` is untouched. The protocol is **read-only by design** — no verb writes state from
+  untrusted input (no remote `remember`/`kv-set`), so a hostile peer can't inject into the agent's
+  memory through it. Advertised in `!help` and via the `about` verb. ([`a2a_reply`](agent_cron.py))
+- **Structured peer profile + standing goal (memory upgrade).** Alongside the raw q/a turns, the
+  agent now keeps a compact per-peer profile keyed by DID (preferred language + most-recent coins)
+  and injects it as one context line, so replies recall *who this peer is* without replaying whole
+  turns. A standing **goal** (`AGENT_GOAL`) is prepended to every inference's system prompt so the
+  agent stays on-mission instead of drifting into a chatbot, and is mirrored to a public
+  `/kv/<ns>/goal` note for humans/agents to audit what it's doing.
+- **Duplicate-post guard.** Replies and proactive messages are de-duplicated per *(recipient,
+  content)* within a 6h window, so an echo-loop with one peer can't make the agent repeat the exact
+  same line; identical generic lines to *different* peers are still allowed. Time-gated broadcasts
+  (telemetry/manifest/alert) are unaffected.
+- **Compute-buying scaffold: inference sessions (3:1) + stake delegation.** Aligns the agent
+  with the two — and only two — airdrop-earning paths in the FLOP agent spec
+  (`intro.flop.network/agent.html`): paying miners for inference, and delegating stake.
+  [`flop_session.py`](flop_session.py) models the 5-field session request (model-weight hash ·
+  max latency · FLOPs · security flags · fee) → mempool submit → PoUI → `verify_poui` →
+  `settle()` (via `token_manager.spend()`, so real settlement accrues the 3:1 unlock) or
+  `dispute()`; `run_inference_session()` runs the full loop, with a mock miner/PoUI in
+  simulation. [`flop_stake.py`](flop_stake.py) adds `delegate`/`undelegate`/`record_reward`/
+  `stake_status` on the shared `token_ledger.json` (a small public `token_manager.save_ledger`
+  helper was added for it). Both are gated default-OFF (`FLOP_SESSION_ENABLED` /
+  `FLOP_STAKE_ENABLED`), never fabricate a tx (missing endpoint ⇒ `skipped_unconfigured`), and
+  are honest about scope (`verify_poui` checks linkage/presence, not cryptographic soundness; no
+  invented stake-reward rate). Preparation only — earns nothing until FLOP testnet is live. Adds
+  17 tests (`test_flop_session.py`, `test_flop_stake.py`).
+- **Durable state mirrored to KV + optional multi-runner coordination.** The broadcast cooldown
+  timers (`last_telemetry`/`last_manifest`/`last_digest`/`last_recap`) plus cursor and weekly/alert
+  state are now mirrored to the KV store (`hydrate_durable_from_kv` / `persist_durable_to_kv`) and
+  re-hydrated at startup, so the agent won't re-post broadcasts even if the GitHub Actions
+  `state.json` cache is evicted. Also adds a `RUNNER_ROLE` (`primary`/`backup`) + KV **heartbeat**
+  handoff so a second runner can be added later without double-posting: the primary stamps a
+  heartbeat each run; a `backup` **stands down** while that heartbeat is fresh
+  (`BACKUP_STANDBY_MINUTES`, default 45) and only takes over when it goes stale. Manual
+  `workflow_dispatch` bypasses standby. The Actions workflow defaults to `RUNNER_ROLE=primary`
+  (single runner). Adds tests for heartbeat freshness, durable hydrate/persist, and the
+  standby/force gate. The scheme is clean for one primary + one backup; a third concurrent runner
+  would need a KV lease/lock.
 - **DeepSeek is now the primary LLM provider, with Gemini as the fallback.** `LLM_PROVIDER=auto`
   (default) builds a provider chain **DeepSeek → Gemini → OpenAI**, keeping only providers that
   have a key; if the primary errors at call time, the agent automatically retries the next one
