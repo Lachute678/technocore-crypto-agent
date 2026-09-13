@@ -271,6 +271,10 @@ KIBBLE_MAX_PER_RUN = int(_env_float("FLOP_KIBBLE_MAX_PER_RUN", 2))
 KIBBLE_MAX_CHARS = int(_env_float("FLOP_KIBBLE_MAX_CHARS", 1200))
 KIBBLE_DO_CLAIM = os.environ.get("FLOP_KIBBLE_CLAIM", "on").strip().lower() not in (
     "0", "false", "off", "no")
+# Tracker ATTEST: ghi lại DELIVER thật + đối chiếu rh của ATTEST -> đo tỉ lệ 'useful' của
+# CHÍNH mình (baseline chất lượng kibble). Mặc định TẮT; chỉ đọc/ghi 1 KV note khi bật.
+KIBBLE_TRACK_ENABLED = os.environ.get("FLOP_KIBBLE_TRACK_ENABLED", "").strip().lower() in (
+    "1", "true", "on", "yes")
 KIBBLE_TEMPERATURE = _env_float("FLOP_KIBBLE_TEMPERATURE", 0.3)
 # Ngân sách token ĐẦU RA cho việc kibble/tclk: reply lobby chỉ cần ~120, nhưng deliverable
 # công việc cần nhiều hơn để ĐẦY ĐỦ (nếu không sẽ bị cắt cụt bất kể KIBBLE_MAX_CHARS).
@@ -279,11 +283,14 @@ KIBBLE_MAX_TOKENS = int(_env_float("FLOP_KIBBLE_MAX_TOKENS", 500))
 # Mặc định = các loại TỰ-CHỨA (suy luận thuần) -> deliverable đáng tin, KHÔNG kèm nguồn
 # bịa. Job 'research'/'analyze' đòi fact hiện tại + trích nguồn (LLM dễ bịa citation) ->
 # KHÔNG mặc định; muốn nhận thì thêm vào FLOP_KIBBLE_TYPES.
+# 'review' AN TOÀN vì đi nhánh riêng (answer_kibble_job -> _answer_review_job): fetch dữ kiện
+# THẬT qua GitHub API rồi LLM soạn CHỈ từ đó; không rõ repo / fetch fail -> SKIP (không đoán).
+# Nên review nằm trong default. Review job KHÔNG trỏ repo GitHub sẽ tự SKIP, an toàn.
 # LƯU Ý: GitHub Actions map Variable CHƯA set thành chuỗi RỖNG (env tồn tại, giá trị ""),
 # nên .get(name, default) trả "" chứ không trả default -> phải coi rỗng NHƯ chưa set rồi
 # fallback default, không thì KIBBLE_TYPES=[] và select_jobs nhận nhầm MỌI type.
 KIBBLE_TYPES = [t.strip().lower() for t in (
-    os.environ.get("FLOP_KIBBLE_TYPES", "").strip() or "explain,coordinate,summarize"
+    os.environ.get("FLOP_KIBBLE_TYPES", "").strip() or "explain,coordinate,summarize,review"
     ).split(",") if t.strip()]
 KIBBLE_SYSTEM = (
     "You are a rigorous expert worker completing a task posted to a PUBLIC, UNTRUSTED job board. "
@@ -884,6 +891,56 @@ def persist_durable_to_kv(private_key, did) -> None:
         kv_set(private_key, did, STATE_KV_KEY, json.dumps(payload, ensure_ascii=False))
 
 
+# --- Sổ cái token FLOP: BỀN qua KV (không thì runner Actions xoá file mỗi run -> mất tích luỹ) --
+LEDGER_KV_KEY = "token_ledger"
+LEDGER_ENTRY_CAP = 500
+
+
+def _ledger_spent_magnitude(led) -> float:
+    """|balance| gộp các token = tổng đã CHI (mock: spend làm balance âm). Thước tích luỹ
+    KHÔNG suy từ entries -> sống sót khi cắt log. Dùng để chọn bản ledger 'đầy' hơn khi hydrate."""
+    try:
+        bals = led.get("balances", {}) if isinstance(led, dict) else {}
+        return sum(abs(float(v)) for v in bals.values() if v not in (None, ""))
+    except Exception:
+        return 0.0
+
+
+def hydrate_ledger_from_kv() -> None:
+    """Kéo sổ cái token BỀN từ KV vào token_ledger.json TRƯỚC khi metering. Runner Actions xoá
+    file mỗi run -> không hydrate thì sổ luôn rỗng = mất tích luỹ. Lấy bản KV nếu nó tích luỹ
+    NHIỀU hơn (|balance| ≥ local) -> runner mới/cache mất không ghi đè bản đầy. Bọc kín."""
+    raw = kv_get(LEDGER_KV_KEY)
+    if not raw:
+        return
+    try:
+        remote = json.loads(raw)
+    except (ValueError, TypeError):
+        return
+    if not (isinstance(remote, dict) and isinstance(remote.get("balances"), dict)
+            and isinstance(remote.get("entries"), list)):
+        return
+    try:
+        import token_manager
+        if _ledger_spent_magnitude(remote) >= _ledger_spent_magnitude(token_manager.load_ledger()):
+            token_manager.save_ledger(remote)
+    except Exception as e:
+        print(f"[ledger] hydrate bỏ qua ({str(e)[:80]})")
+
+
+def persist_ledger_to_kv(private_key, did) -> None:
+    """Đẩy sổ cái token lên KV (nguồn bền chung mọi runner). Cắt entries còn LEDGER_ENTRY_CAP
+    gần nhất để BOUNDED — balances là tổng chạy (KHÔNG suy từ entries) nên cắt log KHÔNG sai số dư."""
+    try:
+        import token_manager
+        led = token_manager.load_ledger()
+        payload = {"balances": led.get("balances", {}),
+                   "entries": (led.get("entries", []) or [])[-LEDGER_ENTRY_CAP:]}
+        kv_set(private_key, did, LEDGER_KV_KEY, json.dumps(payload, ensure_ascii=False))
+    except Exception as e:
+        print(f"[ledger] persist bỏ qua ({str(e)[:80]})")
+
+
 # =========================================================================
 #  INPUT ISOLATION & GUARDRAILS
 #  Mọi dữ liệu từ phòng chat / KV / người lạ đều UNTRUSTED. Cô lập tại 1
@@ -1277,6 +1334,153 @@ def _llm_generate(prompt: str, system: str, temperature: float, memo: str,
     return text
 
 
+# ── (kibble) Nhánh REVIEW: chỉ nhận job trỏ tới 1 repo GitHub CỤ THỂ; lấy dữ kiện THẬT qua
+#    GitHub API rồi để LLM soạn báo cáo CHỈ từ dữ kiện đó. Không rõ repo / fetch fail -> SKIP
+#    (KHÔNG đoán). Đây là điều kiện để job factual đi qua mà vẫn verify được (re-run đối chứng).
+_GH_URL_RE = re.compile(r"github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)", re.I)
+_GH_SLUG_RE = re.compile(r"\b([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)\b")
+
+
+def _parse_github_target(text: str):
+    """Rút (owner, repo) nếu job trỏ tới 1 repo GitHub cụ thể. Ưu tiên URL github.com; nếu
+    không có URL nhưng có nhắc 'github' + 1 slug owner/repo thì lấy slug. None nếu không rõ."""
+    m = _GH_URL_RE.search(text or "")
+    if not m and re.search(r"\bgithub\b", text or "", re.I):
+        m = _GH_SLUG_RE.search(text or "")
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    for suf in (".git", ".",):
+        if repo.endswith(suf):
+            repo = repo[: -len(suf)]
+    return (owner, repo) if owner and repo else None
+
+
+def _gh_get(path: str, params=None):
+    """GET GitHub API (unauth). None nếu lỗi mạng / status != 200 / JSON hỏng (fail-closed)."""
+    try:
+        r = requests.get("https://api.github.com" + path,
+                         headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
+                         params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _github_repo_facts(owner: str, repo: str):
+    """Dữ kiện THẬT về repo. None nếu repo core fetch fail (-> caller SKIP). Từng dữ kiện có
+    NHÃN chính xác để validator re-run đối chứng được (vd 'open issues' đã loại PR qua search)."""
+    core = _gh_get(f"/repos/{owner}/{repo}")
+    if not isinstance(core, dict) or "full_name" not in core:
+        return None
+    # Last commit trên default branch (chính xác hơn pushed_at); fail -> lùi về pushed_at (có nhãn).
+    commits = _gh_get(f"/repos/{owner}/{repo}/commits", {"per_page": 1})
+    if isinstance(commits, list) and commits:
+        last_commit = (commits[0].get("commit", {}).get("committer", {}) or {}).get("date") or "?"
+        last_commit_label = "last commit"
+    else:
+        last_commit = core.get("pushed_at") or "?"
+        last_commit_label = "last push"
+    # Số ISSUE mở đúng nghĩa (loại PR) qua search; fail -> lùi về open_issues_count (issues+PRs, có nhãn).
+    srch = _gh_get("/search/issues", {"q": f"repo:{owner}/{repo} type:issue state:open", "per_page": 1})
+    if isinstance(srch, dict) and "total_count" in srch:
+        issues, issues_label = srch["total_count"], "open issues"
+    else:
+        issues, issues_label = core.get("open_issues_count", "?"), "open issues+PRs"
+    return {
+        "full_name": core.get("full_name"),
+        "last_commit": last_commit, "last_commit_label": last_commit_label,
+        "issues": issues, "issues_label": issues_label,
+        "stars": core.get("stargazers_count", "?"),
+        "default_branch": core.get("default_branch", "?"),
+        "archived": bool(core.get("archived")),
+    }
+
+
+# Tên dự án đứng NGAY TRƯỚC 'GitHub' trong job kiểu "Check DuckDB's GitHub" / "X on GitHub".
+# Board thật nêu TÊN dự án chứ hiếm khi nêu slug owner/repo -> cần resolve tên -> repo.
+_GH_NAME_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9.+\-]{1,40})(?:'s)?\s+(?:on\s+)?github\b", re.I)
+_GH_NAME_STOP = {"the", "a", "an", "this", "that", "on", "check", "review", "its", "your", "our"}
+
+
+def _extract_project_name(text: str):
+    """Rút TÊN dự án ngay trước 'GitHub'. None nếu không có / trúng từ nối vô nghĩa."""
+    m = _GH_NAME_RE.search(text or "")
+    if not m:
+        return None
+    name = m.group(1).strip(".'-")
+    return name if name and name.lower() not in _GH_NAME_STOP else None
+
+
+def _search_github_repo(name: str):
+    """Tên dự án -> (owner, repo) qua search API. CHỈ nhận khi repo name KHỚP CHÍNH XÁC tên
+    (chống chọn nhầm repo trùng tên); mơ hồ / fetch fail -> None (caller SKIP, không đoán)."""
+    data = _gh_get("/search/repositories",
+                   {"q": name, "sort": "stars", "order": "desc", "per_page": 5})
+    if not isinstance(data, dict):
+        return None
+    want = name.lower().replace(" ", "")
+    for item in (data.get("items") or []):
+        if (item.get("name") or "").lower().replace(" ", "") == want:
+            full = item.get("full_name") or ""
+            if "/" in full:
+                owner, repo = full.split("/", 1)
+                return (owner, repo)
+    return None
+
+
+def _resolve_github_repo(text: str):
+    """Xác định repo GitHub cho job review: ưu tiên slug/URL (thuần, không mạng); nếu không có
+    mà job NHẮC 'github' + nêu tên dự án -> resolve tên -> repo qua search (khớp tên chặt).
+    None -> SKIP (không đoán)."""
+    direct = _parse_github_target(text)
+    if direct:
+        return direct
+    if not re.search(r"\bgithub\b", text or "", re.I):
+        return None
+    name = _extract_project_name(text)
+    return _search_github_repo(name) if name else None
+
+
+def _answer_review_job(job: dict, task: str):
+    """Làm job REVIEW cho 1 repo GitHub: xác định repo (slug/URL hoặc resolve TÊN dự án) ->
+    fetch dữ kiện thật -> LLM soạn CHỈ từ dữ kiện đó -> đính kèm dòng [verified]. Không rõ
+    repo / fetch fail / model từ chối -> None (SKIP)."""
+    target = _resolve_github_repo(f"{job.get('title','')} {job.get('body','')}")
+    if not target:
+        print(f"[kibble] review skip {job.get('jobid')} — không xác định repo GitHub cụ thể")
+        return None
+    facts = _github_repo_facts(*target)
+    if not facts:
+        print(f"[kibble] review skip {job.get('jobid')} — fetch GitHub thất bại (không đoán)")
+        return None
+    facts_line = (f"{facts['full_name']} — {facts['last_commit_label']}: {facts['last_commit']}; "
+                  f"{facts['issues_label']}: {facts['issues']}; stars: {facts['stars']}; "
+                  f"default branch: {facts['default_branch']}"
+                  + ("; ARCHIVED" if facts["archived"] else ""))
+    grounded = (f"{task}\n\nVERIFIED FACTS (fetched live from the GitHub API just now — use ONLY "
+                f"these; do NOT add any number, date, or claim not present here):\n{facts_line}")
+    if not _active_provider():
+        return None
+    try:
+        raw, provider = _provider_reply(isolate_for_llm(grounded), KIBBLE_SYSTEM,
+                                        KIBBLE_TEMPERATURE, max_tokens=KIBBLE_MAX_TOKENS)
+    except Exception as e:
+        print(f"[kibble] review answer failed | {e}")
+        return None
+    text = guard_output(" ".join((raw or "").split()).strip())
+    if not text or _is_refusal(text) or (len(text) <= 40 and text.upper().startswith("SKIP")):
+        print(f"[kibble] review skip {job.get('jobid')} — model rỗng/SKIP/từ chối")
+        return None
+    tail = f" [verified] {facts_line}"
+    text = text[: max(0, KIBBLE_MAX_CHARS - len(tail))].rstrip() + tail
+    _meter_flop(f"{provider} kibble:review", event_id=job.get("jobid"))
+    print(f"[kibble:{provider}] answered {job.get('jobid')} (review {facts['full_name']})")
+    return text
+
+
 def answer_kibble_job(job: dict):
     """Sinh nội dung bàn giao cho MỘT job kibble. Nội dung job là UNTRUSTED (do agent lạ
     đăng) -> BẮT BUỘC đi qua isolate_for_llm + guard_output như reply cho người lạ. Trả None
@@ -1287,6 +1491,8 @@ def answer_kibble_job(job: dict):
         return None
     jtype = (job.get("type") or "").strip()
     task = f"[task type: {jtype}] {job.get('title', '').strip()}\n\n{job.get('body', '').strip()}".strip()
+    if jtype == "review":                        # job factual -> đi nhánh fetch-verify, không đoán
+        return _answer_review_job(job, task)
     prompt = isolate_for_llm(task)
     try:
         raw, provider = _provider_reply(prompt, KIBBLE_SYSTEM, KIBBLE_TEMPERATURE,
@@ -2072,6 +2278,7 @@ def main():
     # Hydrate mốc cooldown/cursor BỀN từ KV -> chống re-post khi state cục bộ mất/lệch giữa runner
     # và đồng bộ cooldown giữa 2 runner. Đặt TRƯỚC mọi kiểm tra _due bên dưới.
     hydrate_durable_from_kv(state)
+    hydrate_ledger_from_kv()          # sổ cái token BỀN qua KV -> metering tích luỹ, không mất mỗi run
     now = int(time.time())
     # Run thủ công (workflow_dispatch) luôn phát để dễ kiểm chứng.
     force = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -2208,6 +2415,20 @@ def main():
                         "kibble_done": state.get("kibble_done", [])})
             mode = "dry" if KIBBLE_DRY_RUN else "live"
             kibble_status = f"{mode} {len(ks['delivered'])}✓/{ks['skipped']}skip/{ks['scanned']}scan"
+            # Tracker ATTEST (GATED): ghi DELIVER thật của mình + đối chiếu rh của ATTEST trong
+            # buffer đã fetch -> đo tỉ lệ 'useful'. Bọc kín: lỗi ở đây KHÔNG làm sập run.
+            if KIBBLE_TRACK_ENABLED:
+                try:
+                    import flop_kibble_track as kt
+                    if not KIBBLE_DRY_RUN and ks.get("delivered_items"):
+                        kt.record_deliveries(state, ks["delivered_items"], now * 1000)
+                    sm = kt.reconcile(state, ks.get("messages", []), now * 1000)
+                    save_state({"kibble_deliveries": state.get("kibble_deliveries", [])})
+                    line = kt.summary_line(sm)
+                    kv_set(private_key, did, "kibble-score", line)   # audit công khai 1 GET
+                    kibble_status += f" | {line}"
+                except Exception as e:
+                    print(f"[kibble-track] bỏ qua ({str(e)[:100]})")
         except Exception as e:
             kibble_status = "error"
             print(f"[kibble] bỏ qua ({str(e)[:100]})")
@@ -2252,6 +2473,11 @@ def main():
     elif TCLK_COMPLETE_ENABLED:
         try:
             import flop_tclk
+            import flop_rail_x402
+            # Rail GIÁ-TRỊ (Phương án A): None khi FLOP_TCLK_X402_ENABLED tắt (mặc định) -> giữ paper.
+            # Khi bật + đã có HTLC contract: tiêm submit_fn (ký secp256k1 + gửi tx) / read_fn (eth_call)
+            # ở đây; chưa tiêm -> rail.configured()=False -> verify_lock False, deal chỉ CHỜ (an toàn).
+            value_rail = flop_rail_x402.build_rail(submit_fn=None, read_fn=None)  # TODO: wire EVM
             cs = flop_tclk.run_tclk_complete(
                 read_room_fn=lambda room: fetch_messages(None, room=room),
                 kv_get_fn=kv_get_ns,
@@ -2259,6 +2485,7 @@ def main():
                 do_work_fn=tclk_do_work,
                 state=state, my_did=did, now_ms=now * 1000,
                 offers_room=TCLK_ROOM,          # lock/reveal ở lại room offers (deal room cap đầy)
+                value_rail=value_rail,
                 dry_run=TCLK_COMPLETE_DRY_RUN,
             )
             save_state({"tclk_secrets": state.get("tclk_secrets", {}),
@@ -2297,6 +2524,44 @@ def main():
             tclk_offer_status = "error"
             print(f"[tclk-payer] bỏ qua ({str(e)[:100]})")
 
+    # 3a6) (Tùy chọn, GATED) VOTER cho contest sonnet-1 của FLOP Labs (technocore-sonnet-challange).
+    #      Mặc định TẮT (SONNET_VOTER_ENABLED) -> agent không đổi hành vi. Khi bật:
+    #        - đăng ký voter 1 LẦN (idempotent qua state['sonnet_registered']);
+    #        - CHỈ bỏ phiếu khi có SONNET_BALLOT_ENTRY tường minh (không vote bừa), và chỉ POST
+    #          lại khi entry đổi so với lần trước (đổi phiếu được tới D). Logic + guard ở sonnet_voter.
+    #      register/ballot là POST -> cùng health-guard đường ghi như kibble/tclk. Bọc kín.
+    sonnet_status = "off"
+    _sonnet_on = os.environ.get("SONNET_VOTER_ENABLED", "").strip().lower() in ("1", "true", "on", "yes")
+    if _sonnet_on and posts_degraded():
+        sonnet_status = "skip-outage"
+        print(f"[sonnet] bỏ qua — đường ghi lỗi (post ok={_post_ok_count} fail={_post_fail_count}).")
+    elif _sonnet_on:
+        try:
+            import sonnet_voter
+            if not state.get("sonnet_registered"):
+                r = sonnet_voter.register_voter(private_key, did, post_fn=post_message)
+                reg = r.get("outcome")
+                if reg == "registered":
+                    state["sonnet_registered"] = True
+                    save_state({"sonnet_registered": True})
+            else:
+                reg = "already"
+            entry = sonnet_voter.preferred_entry()
+            if not entry:
+                vote = "no_choice"
+            elif entry == state.get("sonnet_voted_entry"):
+                vote = "voted-cached"
+            else:
+                b = sonnet_voter.cast_ballot(private_key, did, entry_id=entry, post_fn=post_message)
+                vote = b.get("outcome")
+                if vote == "voted":
+                    state["sonnet_voted_entry"] = entry
+                    save_state({"sonnet_voted_entry": entry})
+            sonnet_status = f"reg:{reg} vote:{vote}"
+        except Exception as e:
+            sonnet_status = "error"
+            print(f"[sonnet] bỏ qua ({str(e)[:100]})")
+
     # 3b) (Tùy chọn, GATED) Công khai tiến độ MỞ KHÓA MAINNET 3:1 vào KV note `unlock`
     #     để ai cũng audit được (GET /kv/<ns>/unlock). Mặc định TẮT (FLOP_PUBLISH_UNLOCK)
     #     -> agent không đổi hành vi. Bọc kín: lỗi bị nuốt, không làm sập run.
@@ -2330,12 +2595,14 @@ def main():
         f"- recap: **{recap_status}**",
         f"- kibble: **{kibble_status}**",
         f"- tclk: **{tclk_status}** · complete: **{tclk_done_status}**",
+        f"- sonnet: **{sonnet_status}**",
         f"- replies: **{replies}** · proactive: **{proactive}**",
         f"- technocore.chat 200s: **{_server_ok_count}**",
     ]
     print(f"[run] telemetry={tele_status} manifest={manifest_status} "
           f"digest={digest_status} recap={recap_status} kibble={kibble_status} "
-          f"tclk={tclk_status} tclk_done={tclk_done_status} tclk_offer={tclk_offer_status} replies={replies} "
+          f"tclk={tclk_status} tclk_done={tclk_done_status} tclk_offer={tclk_offer_status} "
+          f"sonnet={sonnet_status} replies={replies} "
           f"proactive={proactive} server200s={_server_ok_count}")
 
     if _server_ok_count == 0:
@@ -2348,6 +2615,14 @@ def main():
     # Mirror mốc BỀN lên KV (chống mất khi cache Actions bị xoá + dùng chung nếu có runner phụ). Đặt SAU
     # kiểm tra outage để 1 lần kv_set thành công ở đây không che giấu outage thật.
     persist_durable_to_kv(private_key, did)
+    persist_ledger_to_kv(private_key, did)   # đẩy sổ cái token (metering) lên KV -> bền, đo được
+    try:                                     # telemetry: đo đóng góp inference tích luỹ (mock/testnet)
+        import token_manager
+        _st = token_manager.spend_stats()
+        print(f"[ledger] spent_total_mock={token_manager.check_balance()} "
+              f"spend_24h={_st['spend_count_24h']} spend_recent={_st['spend_count_total']}")
+    except Exception:
+        pass
 
     _write_summary(summary)
 
