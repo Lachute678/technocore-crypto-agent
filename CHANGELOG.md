@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Multi-room listen & respond (`AGENT_ROOMS`).** `auto_respond` can now listen and reply across
+  a CSV list of rooms (e.g. `lobby,meta,flop`) in one run, each reply routed back to the room it
+  came from. Kept **synchronous** (the codebase is `requests` + 5-min cron — fetching a few rooms
+  sequentially costs ~1-2s, so `asyncio` would add a rewrite and failure modes for no real gain);
+  the actual work is a **per-room cursor** (`state['cursors']` + a durable KV `cursors` note),
+  with a new-room first run skipping its backlog and the legacy single `last_seq` migrated into
+  `cursors[AGENT_ROOM]`. Reply/proactive/engage caps stay **shared per run** (not multiplied by
+  room count, so it can't burst past the ~300/min rate limit); the engage pass now draws from the
+  **pooled** messages of all rooms. Empty `AGENT_ROOMS` ⇒ exactly the old single-room behaviour
+  (same `last_seq`/KV `cursor`, same fetch call — no extra KV traffic). Adds 4 tests (487 total).
+- **Peer-engage pass (`flop_engage.py`) — build reply-distance honestly, gated + dry-run.**
+  Independent census radars rank agents by reply-distance (how many distinct signed keys replied to
+  you), which a broadcast-only agent scores ~0 on even while doing real work. After `auto_respond`
+  processes inbound messages, this new pass picks **one independent peer** who just posted something
+  substantive and asks **one genuine, on-topic question** (LLM-composed through the same isolate/
+  guard path, grounded with live data when relevant) to invite a substantive reply — creating a real
+  edge from a distinct signed key; can't form a genuine question ⇒ posts nothing. Anti-farm by
+  construction: breadth over depth (one question per peer per `FLOP_ENGAGE_COOLDOWN_HOURS`, default
+  72), reuses `PROACTIVE_DENY_DIDS` so the fork fleet never engages itself (no self-talking cluster),
+  signed peers only, small per-run cap (default 1), paced + dedup'd. Default OFF + dry-run. Pure
+  select/filter/cooldown logic; IO (LLM, post) injected. Adds 17 tests (`test_flop_engage.py`).
+- **Expanded market data (all keyless) + 5 new oracle commands + kibble analysis grounding.**
+  Adds three new keyless data sources alongside the existing CoinGecko/Binance price feed, each a
+  fail-closed `try/except` with a short cache: **Binance USDT-M Futures** (`get_perp` → funding
+  rate %/8h, mark price, open interest in coins and USD notional), **CoinGecko multi-timeframe**
+  (`get_change` → 1h/24h/7d/30d %), and **DeFiLlama** (`get_defi_tvl`/`get_tvl_top`/
+  `get_protocol_tvl` → DeFi TVL by total/chain/protocol, `get_stablecoin_cap` → stablecoin market
+  cap). Surfaced as new commands `!change [coin]`, `!funding [coin]`, `!oi [coin]`,
+  `!tvl [chain|protocol]`, `!stables` (and matching read-only A2A verbs
+  `change|funding|oi|tvl|stables`). Two new LLM grounding tones (`deriv`, `defi`) feed funding/OI
+  and TVL/stablecoin snapshots into free-form replies. **Kibble unlock:** `answer_kibble_job` now
+  prepends the same live snapshot to market-topic jobs, so `analyze`/`research` jobs can be
+  accepted with answers grounded in real numbers instead of stale-knowledge hallucination (still
+  SKIP-able). No new secrets — every source is keyless, preserving the no-key market-data posture.
+  Adds 25 tests (466 total).
 - **tclk payee: text-only job filter at accept time.** The payee now reads an offer's job spec
   (`job.context`) before accepting and **skips jobs that need media** (video/image — a text LLM
   can't genuinely deliver them), instead of accepting and only bailing later via the completion

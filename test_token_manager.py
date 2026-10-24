@@ -9,6 +9,8 @@ meter_inference gating.
 import json
 import pytest
 
+from decimal import Decimal
+
 import token_manager as tm
 
 
@@ -17,8 +19,9 @@ def _clean_env(monkeypatch):
     """Mỗi test khởi đầu ở simulation, không dính env FLOP_/TESTNET_ của máy chạy."""
     for k in ("TESTNET_ENABLED", "FLOP_RPC_URL", "FLOP_SUBMIT_URL", "FLOP_TX_MODE",
               "FLOP_TOKEN_SYMBOL", "TOKEN_LEDGER_FILE", "FLOP_METER_ENABLED",
-              "FLOP_INFERENCE_COST", "FLOP_ORGANIC_ONLY", "FLOP_MAX_SPENDS_PER_HOUR"):
+              "FLOP_INFERENCE_COST", "FLOP_MAX_SPENDS_PER_HOUR"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FLOP_ORGANIC_ONLY", "off")       # tắt tường minh; test riêng bật lại
 
 
 @pytest.fixture
@@ -239,3 +242,418 @@ def test_spend_stats_24h_window(ledger):
     st = tm.spend_stats(now=now, path=ledger)
     assert st["spend_count_total"] == 2              # cả 2 spend, bỏ credit
     assert st["spend_count_24h"] == 1                # chỉ entry trong 24h
+
+
+# --- hạt giống MÔ PHỎNG (chỉ simulation) ---------------------------------------------
+
+def test_sim_credit_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLOP_SIM_CREDIT", raising=False)
+    r = tm.maybe_sim_credit(path=str(tmp_path / "l.json"))
+    assert r["outcome"] == "skipped_disabled"
+
+
+def test_sim_credit_refuses_on_testnet(tmp_path, monkeypatch):
+    """Chốt quan trọng nhất: hạt giống mô phỏng KHÔNG BAO GIỜ chạm sổ cái testnet thật."""
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    p = str(tmp_path / "l.json")
+    assert tm.maybe_sim_credit(path=p)["outcome"] == "skipped_testnet"
+    assert tm.check_balance(path=p) == "0"          # không nạp gì cả
+
+
+def test_sim_credit_seeds_once_then_stops(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "credited"
+    assert tm.check_balance(path=p) == "100"
+    r2 = tm.maybe_sim_credit(path=p, log=lambda *a: None)       # đã có tiền -> không chồng
+    assert r2["outcome"] == "skipped_has_balance"
+    assert tm.check_balance(path=p) == "100"
+
+
+def test_sim_credit_rejects_bad_amount(tmp_path, monkeypatch):
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    for bad in ("khong-phai-so", "-5", "0", "NaN"):
+        monkeypatch.setenv("FLOP_SIM_CREDIT", bad)
+        assert tm.maybe_sim_credit(path=p)["outcome"] == "skipped_bad_amount"
+    assert tm.check_balance(path=p) == "0"
+
+
+def test_sim_credit_memo_says_it_is_simulated(tmp_path, monkeypatch):
+    """Sổ cái được publish CÔNG KHAI -> dòng credit phải tự nói nó là mô phỏng."""
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "50")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.maybe_sim_credit(path=p, log=lambda *a: None)
+    memo = tm.load_ledger(p)["entries"][0]["memo"].lower()
+    assert "simulation" in memo and "faucet that" in memo
+
+
+def test_metering_works_after_seed(tmp_path, monkeypatch):
+    """Chuỗi đầy đủ: hạt giống -> metering hết skipped_insufficient."""
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "10")
+    monkeypatch.setenv("FLOP_METER_ENABLED", "on")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    assert tm.meter_inference(memo="x", event_id="k1", path=p)["outcome"] == "skipped_insufficient"
+    tm.maybe_sim_credit(path=p, log=lambda *a: None)
+    assert tm.meter_inference(memo="x", event_id="k1", path=p)["outcome"] == "spent_simulated"
+
+
+# --- available_today: nền của FLOP_DAILY_BUDGET=auto ----------------------------------
+
+def test_available_today_counts_balance_plus_todays_spend(tmp_path):
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    assert tm.available_today(path=p) == "100"
+    tm.spend("40", memo="x", path=p)
+    assert tm.check_balance(path=p) == "60"
+    assert tm.available_today(path=p) == "100"          # 60 còn + 40 đã chi hôm nay
+
+
+def test_available_today_ignores_yesterdays_spend(tmp_path):
+    """Chi của hôm qua KHÔNG được cộng vào ngân sách hôm nay."""
+    import time as _t
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("40", memo="x", path=p)
+    now = int(_t.time())
+    tomorrow = now - (now % 86400) + 86400 + 3600       # 01:00 UTC ngày mai
+    assert tm.available_today(now=tomorrow, path=p) == "60"    # chỉ còn số dư
+
+
+def test_available_today_empty_wallet_is_zero(tmp_path):
+    assert tm.available_today(path=str(tmp_path / "trong.json")) == "0"
+
+
+def test_available_today_skips_entries_without_timestamp(tmp_path):
+    p = str(tmp_path / "l.json")
+    tm.credit("10", memo="seed", path=p)
+    led = tm.load_ledger(p)
+    led["entries"].append({"kind": "spend", "token": "FLOP", "amount": "5"})   # thiếu ts
+    tm.save_ledger(led, p)
+    assert tm.available_today(path=p) == "10"           # không đoán thời điểm
+
+
+# --- spent_cumulative: mốc CHỈ TĂNG để hydrate không tua ngược sổ cái -----------------
+
+def test_cumulative_accrues_on_simulation_spend(tmp_path):
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    assert tm.cumulative_spent(tm.load_ledger(p)) == Decimal(0)
+    tm.spend("3", memo="x", path=p)
+    tm.spend("2", memo="x", path=p)
+    assert tm.cumulative_spent(tm.load_ledger(p)) == Decimal("5")
+    assert tm.check_balance(path=p) == "95"
+
+
+def test_cumulative_only_grows_while_balance_falls(tmp_path):
+    """Đây CHÍNH LÀ lý do cần nó: số dư đi xuống nên không dùng làm thước tiến độ được."""
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    prev_bal, prev_cum = Decimal("100"), Decimal(0)
+    for _ in range(5):
+        tm.spend("1", memo="x", path=p)
+        bal = Decimal(tm.check_balance(path=p))
+        cum = tm.cumulative_spent(tm.load_ledger(p))
+        assert bal < prev_bal and cum > prev_cum
+        prev_bal, prev_cum = bal, cum
+
+
+def test_cumulative_survives_entry_log_trimming(tmp_path):
+    """Cắt log KHÔNG được làm mốc tụt — nó là tổng chạy, không suy từ entries."""
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    for _ in range(4):
+        tm.spend("1", memo="x", path=p)
+    led = tm.load_ledger(p)
+    led["entries"] = []                              # giả lập publish đã cắt hết log
+    tm.save_ledger(led, p)
+    assert tm.cumulative_spent(tm.load_ledger(p)) == Decimal("4")
+
+
+def test_cumulative_tolerates_garbage():
+    assert tm.cumulative_spent({"spent_cumulative": "rác"}) == Decimal(0)
+    assert tm.cumulative_spent({"spent_cumulative": {"FLOP": None}}) == Decimal(0)
+    assert tm.cumulative_spent({}) == Decimal(0) and tm.cumulative_spent(None) == Decimal(0)
+
+
+def test_spent_today_amount_only_counts_today(tmp_path):
+    import time as _t
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("7", memo="x", path=p)
+    assert tm.spent_today_amount(path=p) == Decimal("7")
+    now = int(_t.time())
+    tomorrow = now - (now % 86400) + 86400 + 60
+    assert tm.spent_today_amount(now=tomorrow, path=p) == Decimal("0")
+
+
+def test_spent_today_amount_skips_entries_without_timestamp(tmp_path):
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    led = tm.load_ledger(p)
+    led["entries"].append({"kind": "spend", "token": "FLOP", "amount": "5"})
+    tm.save_ledger(led, p)
+    assert tm.spent_today_amount(path=p) == Decimal("0")
+
+
+def test_spent_by_day_is_a_running_total_not_derived_from_entries(tmp_path):
+    """Nguồn đúng khi bản KV bị cắt log: tổng chạy theo ngày."""
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("3", memo="x", path=p)
+    tm.spend("4", memo="x", path=p)
+    assert tm.spent_today_amount(path=p) == Decimal("7")
+    led = tm.load_ledger(p)
+    led["entries"] = []                                  # giả lập bản đã cắt sạch log
+    tm.save_ledger(led, p)
+    assert tm.spent_today_amount(path=p) == Decimal("7")   # vẫn đúng
+
+
+def test_spent_by_day_keeps_only_recent_days(tmp_path):
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    led = tm.load_ledger(p)
+    led["spent_by_day"] = {"FLOP": {f"2026-01-{d:02d}": "1" for d in range(1, 21)}}
+    tm.save_ledger(led, p)
+    tm.spend("1", memo="x", path=p)
+    days = tm.load_ledger(p)["spent_by_day"]["FLOP"]
+    assert len(days) <= tm.DAY_KEEP + 1                  # cắt bớt, không phình vô hạn
+
+
+def test_legacy_ledger_without_spent_by_day_still_works(tmp_path):
+    """Sổ cái CŨ chưa có spent_by_day -> rơi về cộng từ entries."""
+    import time as _t
+    p = str(tmp_path / "l.json")
+    ts = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+    tm.save_ledger({"balances": {"FLOP": "9"}, "entries": [
+        {"kind": "spend", "token": "FLOP", "amount": "2", "ts": ts}]}, p)
+    assert tm.spent_today_amount(path=p) == Decimal("2")
+
+
+def test_first_spend_day_is_set_once_and_never_moves(tmp_path):
+    """Cần nó để biết 'đang ở ngày thứ mấy' — spent_by_day chỉ giữ 7 ngày."""
+    import time as _t
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("1", memo="x", path=p)
+    first = tm.load_ledger(p)["first_spend_day"]
+    assert first == _t.strftime("%Y-%m-%d", _t.gmtime())
+    tm.spend("1", memo="x", path=p)
+    assert tm.load_ledger(p)["first_spend_day"] == first      # không đổi
+
+
+def test_first_spend_day_repairs_a_null_from_an_old_publish(tmp_path):
+    """Bản publish trước #137 ghi `first_spend_day: null`. setdefault KHÔNG sửa được khoá
+    đã tồn tại, nên None nằm lại vĩnh viễn — production đúng như vậy."""
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "100"}, "entries": [], "first_spend_day": None,
+                    "spent_by_day": {"FLOP": {"2026-10-17": "90.9"}}}, p)
+    tm.spend("1", memo="x", path=p)
+    assert tm.load_ledger(p)["first_spend_day"] == "2026-10-17"   # lấy ngày SỚM NHẤT đã biết
+
+
+def test_first_spend_day_defaults_to_today_when_nothing_known(tmp_path):
+    import time as _t
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("1", memo="x", path=p)
+    assert tm.load_ledger(p)["first_spend_day"] == _t.strftime("%Y-%m-%d", _t.gmtime())
+
+
+def test_sim_credit_refills_when_only_dust_is_left(tmp_path, monkeypatch):
+    """Qua nửa đêm ví còn 0.205 bụi: '> 0' nên KHÔNG bao giờ nạp lại, ngân sách ngày mới teo."""
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "0.205"}, "entries": []}, p)
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "credited"
+    assert Decimal(tm.check_balance(path=p)) > Decimal("100")
+
+
+def test_sim_credit_still_refuses_a_funded_wallet(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "50"}, "entries": []}, p)
+    assert tm.maybe_sim_credit(path=p)["outcome"] == "skipped_has_balance"
+
+
+def test_sim_credit_threshold_is_tunable(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.setenv("FLOP_SIM_CREDIT_BELOW", "40")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "30"}, "entries": []}, p)
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "credited"
+
+
+def test_sim_credit_is_capped_to_once_per_day(tmp_path, monkeypatch):
+    """Faucet THẬT có MAX_PER_DAY; hạt giống mô phỏng thì không, nên pacer rút cạn ví rồi
+    nạp lại NGAY trong ngày — đo được 2 lần nạp/ngày, tổng chi 115 thay vì 100."""
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "0"}, "entries": []}, p)
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "credited"
+    tm.spend("100", memo="x", path=p)                      # rút cạn lại trong cùng ngày
+    r = tm.maybe_sim_credit(path=p, log=lambda *a: None)
+    assert r["outcome"] == "skipped_daily_cap" and "trần 1" in r["reason"]
+
+
+def test_sim_credit_resets_on_the_next_utc_day(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "100")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "0"}, "entries": []}, p)
+    t0 = 1_792_000_000
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None, now=t0)["outcome"] == "credited"
+    tm.spend("100", memo="x", path=p)
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None,
+                               now=t0)["outcome"] == "skipped_daily_cap"
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None,
+                               now=t0 + 86400)["outcome"] == "credited"   # ngày mới
+
+
+def test_sim_credit_daily_cap_is_tunable(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOP_SIM_CREDIT", "10")
+    monkeypatch.setenv("FLOP_SIM_CREDIT_MAX_PER_DAY", "3")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    p = str(tmp_path / "l.json")
+    tm.save_ledger({"balances": {"FLOP": "0"}, "entries": []}, p)
+    for _ in range(3):
+        assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "credited"
+        tm.spend("10", memo="x", path=p)
+    assert tm.maybe_sim_credit(path=p, log=lambda *a: None)["outcome"] == "skipped_daily_cap"
+
+
+def test_session_spend_tracked_separately_from_metering(tmp_path, monkeypatch):
+    """Chỉ chi cho phiên đã settle mới vào bộ đếm thước-đo."""
+    monkeypatch.setenv("FLOP_METER_ENABLED", "on")
+    p = str(tmp_path / "l.json")
+    tm.credit("100", memo="seed", path=p)
+    tm.spend("0.001", memo="gemini kibble:explain", path=p)
+    tm.spend("0.05", memo="inference-session:abc", path=p)
+    tm.spend("0.001", memo="gemini tclk-work", path=p)
+    tm.spend("0.05", memo="inference-session:def", path=p)
+    d = tm.load_ledger(p)
+    assert d["spent_cumulative"]["FLOP"] == "0.102"        # gộp cả hai
+    assert d["session_cumulative"]["FLOP"] == "0.1"        # CHỈ phiên
+    assert d["session_count_cumulative"]["FLOP"] == 2
+    assert list(d["session_by_day"]["FLOP"].values()) == ["0.1"]
+
+
+def test_is_session_spend_matches_only_the_session_memo():
+    assert tm.is_session_spend("inference-session:abc") is True
+    for other in ("gemini kibble:explain", "gemini tclk-work", "faucet", "", None):
+        assert tm.is_session_spend(other) is False
+
+
+# --- Mặc định BẬT: fork không đặt Variable vẫn được bảo vệ -------------------------
+def test_organic_only_on_by_default(ledger, monkeypatch):
+    monkeypatch.delenv("FLOP_ORGANIC_ONLY", raising=False)   # vắng biến = BẬT
+    assert tm.organic_only() is True
+    tm.credit("1", path=ledger)
+    monkeypatch.setenv("FLOP_METER_ENABLED", "true")
+    assert tm.meter_inference(path=ledger)["outcome"] == "skipped_synthetic"
+
+
+def test_organic_only_explicit_off(monkeypatch):
+    for v in ("0", "false", "off", "no", "OFF"):
+        monkeypatch.setenv("FLOP_ORGANIC_ONLY", v)
+        assert tm.organic_only() is False
+
+
+
+def test_meter_never_spends_onchain_on_testnet(ledger, monkeypatch):
+    # Metering là proxy mô phỏng. Ở testnet spend() là giao dịch THẬT: memo "gemini kibble"
+    # đốt FLOP thật không được tính, và giành ngân sách của phiên.
+    tm.credit("50", path=ledger)
+    monkeypatch.setenv("FLOP_METER_ENABLED", "true")
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.setenv("FLOP_RPC_URL", "http://rpc.invalid")
+    sent = []
+    r = tm.meter_inference(event_id="job1", path=ledger,
+                           submit_tx=lambda tx: sent.append(tx) or {"tx_hash": "0x1"})
+    assert r["outcome"] == "skipped_testnet"
+    assert sent == [] and tm.check_balance(path=ledger) == "50"
+
+
+def test_spend_counts_survive_kv_entry_trim(ledger, monkeypatch):
+    # Bản đẩy KV chỉ giữ 20 entries: đếm 24h/tổng phải lấy từ tổng chạy, không hụt về 20.
+    monkeypatch.setenv("FLOP_METER_ENABLED", "true")
+    tm.credit("1", path=ledger)
+    for _ in range(30):
+        tm.meter_inference(path=ledger, event_id="e")
+    led = tm.load_ledger(ledger)
+    led["entries"] = led["entries"][-20:]
+    with open(ledger, "w") as f:
+        json.dump(led, f)
+    st = tm.spend_stats(path=ledger)
+    assert st["spend_count_total"] == 30
+    assert st["spend_count_24h"] == 30
+
+
+def test_rate_cap_holds_above_20_after_trim(ledger, monkeypatch):
+    monkeypatch.setenv("FLOP_METER_ENABLED", "true")
+    monkeypatch.setenv("FLOP_MAX_SPENDS_PER_HOUR", "25")
+    tm.credit("1", path=ledger)
+    for _ in range(25):
+        assert tm.meter_inference(path=ledger, event_id="e")["outcome"] == "spent_simulated"
+    led = tm.load_ledger(ledger)
+    led["entries"] = led["entries"][-20:]               # mô phỏng hydrate từ KV
+    with open(ledger, "w") as f:
+        json.dump(led, f)
+    assert tm.meter_inference(path=ledger, event_id="e")["outcome"] == "skipped_rate_cap"
+
+
+def test_hour_buckets_are_bounded(ledger, monkeypatch):
+    st = {}
+    t0 = 1_800_000_000
+    for i in range(40):
+        monkeypatch.setattr(tm.time, "time", lambda i=i: t0 + i * 3600)
+        tm._accrue_cumulative(st, "FLOP", tm.Decimal("0.001"))
+    assert len(st["spend_count_by_hour"]["FLOP"]) == tm.HOUR_KEEP
+
+
+def test_testnet_spend_without_tx_hash_is_not_booked(ledger, monkeypatch):
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.setenv("FLOP_RPC_URL", "https://rpc.test")
+    tm.credit("5", path=ledger)
+    r = tm.spend("1", "inference-session:x", path=ledger, submit_tx=lambda tx: {"status": "ok"})
+    assert r["outcome"] == "error_submit" and "tx hash" in r["reason"]
+    assert tm.check_balance(path=ledger) == "5"
+    assert tm.load_ledger(ledger).get("session_cumulative", {}) == {}
+
+
+
+def test_next_nonce_strictly_increases_within_one_millisecond(monkeypatch):
+    monkeypatch.setattr(tm.time, "time", lambda: 1_800_000_000.0)
+    seq = [int(tm.next_nonce()) for _ in range(5)]
+    assert seq == sorted(seq) and len(set(seq)) == 5
+
+
+
+def test_credit_hour_buckets_are_recorded(ledger):
+    tm.credit("100", path=ledger)
+    tm.credit("5", path=ledger)
+    buckets = tm.load_ledger(ledger)["credit_by_hour"]["FLOP"]
+    assert len(buckets) == 1 and list(buckets.values())[0] == ["105", 2]
+
+
+def test_gateway_spend_books_only_on_testnet_and_counts_as_a_session(ledger, monkeypatch):
+    tm.credit("10", path=ledger)
+    assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1",
+                                   path=ledger)["outcome"] == "skipped_simulation"
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "", path=ledger)["outcome"] \
+        == "skipped_insufficient"                                       # không bằng chứng -> không ghi
+    r = tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1", path=ledger)
+    assert r["outcome"] == "spent_onchain"
+    led = tm.load_ledger(ledger)
+    assert led["session_cumulative"]["FLOP"] == "1.5" and led["entries"][-1]["via"] == "gateway"
+    assert tm.record_gateway_spend("50", "inference-session gateway m1", "chatcmpl-2",
+                                   path=ledger)["balance_after"] == "0"  # kẹp 0, không âm

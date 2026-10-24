@@ -18,7 +18,7 @@ Env:
   FLOP_PACER_FILE     nơi lưu nhịp chi trong ngày (mặc định flop_pacer.json).
   FLOP_PACE_JITTER_PCT  (chống sybil) nhiễu ngẫu nhiên ±X% quanh lượng đến hạn, để nhịp
                         chi KHÔNG rơi đúng mục tiêu tuyến tính tất định (dấu hiệu bot).
-                        Rỗng/0 -> tắt (nhịp tuyến tính như cũ). Kẹp về [0,100].
+                        Rỗng -> MẶC ĐỊNH 20; đặt 0 -> tắt (nhịp tuyến tính). Kẹp [0,100].
 """
 
 import os
@@ -45,14 +45,48 @@ def _fmt(d: Decimal) -> str:
 
 # --- config (đọc live từ env) -----------------------------------------------------
 
-def daily_budget():
-    d = _dec(os.environ.get("FLOP_DAILY_BUDGET", ""))
+def daily_budget(token: str = None, ledger_path: str = None):
+    """Ngân sách FLOP cho hôm nay. Rỗng/không hợp lệ -> None (pacer TẮT).
+
+    `auto` -> suy từ VÍ THẬT: số dư còn lại + đã chi trong ngày UTC. Vì sao cần: faucet
+    nạp mỗi ngày một lượng khác nhau, mà ngân sách cố định thì phải chỉnh tay sau mỗi lần
+    nạp — không ai làm nổi hằng ngày, và token thừa nằm im là phân bổ bị mất
+    ("Holding test tokens earns nothing"). `auto` làm việc đó tự động."""
+    raw = os.environ.get("FLOP_DAILY_BUDGET", "").strip()
+    if raw.lower() == "auto":
+        try:
+            import token_manager as _tm        # import TRỄ: tránh vòng lặp import
+            d = _dec(_tm.available_today(token=token, path=ledger_path))
+        except Exception:
+            return None                        # không đọc được ví -> pacer tắt, không đoán
+        return d if (d is not None and d > 0) else None
+    d = _dec(raw)
     return d if (d is not None and d > 0) else None
 
 
-def max_per_run():
-    d = _dec(os.environ.get("FLOP_MAX_PER_RUN", ""))
-    return d if (d is not None and d > 0) else None
+def max_per_run(budget=None):
+    """Trần cho MỘT lần chi. Nhận hai dạng:
+
+      "2.5"  -> số TUYỆT ĐỐI (hành vi cũ)
+      "2%"   -> PHẦN TRĂM ngân sách ngày
+
+    Vì sao cần dạng %: trần tuyệt đối không co giãn. Đặt 0.5 cho ví 100 FLOP là hợp lý,
+    nhưng khi faucet cấp 100.000/ngày thì nó bóp xuống còn 576/ngày (0,576% ngân sách) —
+    và bóp trong IM LẶNG, cuối ngày mới biết thiếu 99%.
+
+    Rỗng -> KHÔNG trần (giữ đúng hợp đồng cũ của module). Lưu ý vận hành: không trần
+    nghĩa là sau một sự cố dài, phần thiếu dồn lại có thể bị chi hết trong MỘT lần —
+    đúng hình dạng dump mà pacer sinh ra để tránh. Hãy luôn đặt một trần."""
+    raw = os.environ.get("FLOP_MAX_PER_RUN", "").strip()
+    if raw.endswith("%"):
+        pct = _dec(raw[:-1])
+        if pct is None or pct <= 0 or not budget or budget <= 0:
+            return None
+        return budget * pct / Decimal(100)
+    d = _dec(raw)
+    if d is not None and d > 0:
+        return d
+    return None                               # rỗng, hoặc rác/không dương -> không trần
 
 
 def min_spend() -> Decimal:
@@ -60,10 +94,17 @@ def min_spend() -> Decimal:
     return d if (d is not None and d > 0) else Decimal("0.0001")
 
 
+DEFAULT_JITTER_PCT = Decimal(20)
+
+
 def jitter_pct() -> Decimal:
-    """Biên nhiễu ±X% cho nhịp chi (chống "chi đúng mục tiêu = bot"). Rỗng/không
-    dương -> 0 (tắt). Kẹp trần 100 để jitter không lật dấu lượng chi."""
-    d = _dec(os.environ.get("FLOP_PACE_JITTER_PCT", ""))
+    """Biên nhiễu ±X% cho nhịp chi (chống "chi đúng mục tiêu = bot"). Rỗng -> MẶC ĐỊNH
+    20 (FLOP đã công bố phạt "manufactured activity"); 0/âm -> tắt tường minh. Kẹp trần
+    100 để jitter không lật dấu lượng chi."""
+    raw = os.environ.get("FLOP_PACE_JITTER_PCT", "").strip()
+    if not raw:
+        return DEFAULT_JITTER_PCT
+    d = _dec(raw)
     if d is None or d <= 0:
         return Decimal(0)
     return d if d <= 100 else Decimal(100)
@@ -129,26 +170,60 @@ def _rec_for(state: dict, token: str, now: int) -> dict:
 
 # --- API --------------------------------------------------------------------------
 
-def next_spend_amount(token: str = None, now: int = None, path: str = None, rng=None):
+def _spent_today(rec: dict, token: str, now: int, ledger_path: str = None) -> Decimal:
+    """Đã chi hôm nay = MAX(bản ghi của pacer, tổng chi hôm nay trong SỔ CÁI).
+
+    Vì sao lấy MAX chứ không chỉ đọc file pacer: `flop_pacer.json` KHÔNG được cache qua
+    run (workflow chỉ cache `state.json`), nên trên runner nó luôn rỗng -> pacer tưởng
+    hôm nay chưa chi gì -> `due` luôn bằng cả mục tiêu -> chi kịch trần MỌI run và KHÔNG
+    BAO GIỜ hãm. Đo được: ở mốc giữa trưa ngân sách 24, bản nhớ dừng đúng 12.0 còn bản
+    quên chi 20.0 (vượt mục tiêu 67%).
+
+    Sổ cái bền qua KV nên nó là nguồn đúng; vẫn lấy MAX để bản ghi pacer (khi có, vd khi
+    chạy trên VPS có đĩa bền) không bị bỏ qua."""
+    mine = _dec(rec.get("spent_today", "0")) or Decimal(0)
+    if not ledger_path:
+        # KHÔNG tự đi tìm sổ cái mặc định. Caller phải NÊU RÕ sổ cái nào — nếu không,
+        # hàm thuần này lại phụ thuộc vào một file toàn cục trong thư mục làm việc,
+        # khiến kết quả đổi theo việc test nào chạy trước (đúng lỗi đã làm CI đỏ).
+        return mine
+    try:
+        import token_manager as _tm        # import TRỄ: tránh vòng lặp import
+        led = _tm.spent_today_amount(token=token, now=now, path=ledger_path)
+    except Exception:
+        return mine                        # không đọc được sổ cái -> dùng bản ghi pacer
+    return mine if mine > led else led
+
+
+def next_spend_amount(token: str = None, now: int = None, path: str = None, rng=None,
+                      ledger_path: str = None, budget=None):
     """Số FLOP NÊN chi lần chạy này để bám lịch rải đều. Trả:
        None  -> pacer tắt (FLOP_DAILY_BUDGET chưa đặt) -> caller dùng phí cố định;
        "0"   -> chưa tới nhịp (đã bám kịp mục tiêu, hoặc phần đến hạn < FLOP_MIN_SPEND);
        "x.y" -> lượng nên chi để đuổi kịp mục tiêu tuyến tính, đã kẹp trần/lần.
-    `rng` (tùy chọn) là nguồn ngẫu nhiên cho jitter, tiêm được để test tất định."""
-    budget = daily_budget()
+    `rng` (tùy chọn) là nguồn ngẫu nhiên cho jitter, tiêm được để test tất định.
+    `budget` (tùy chọn) ĐÈ FLOP_DAILY_BUDGET: để phiên inference dùng pacer mà không phải
+    bật FLOP_DAILY_BUDGET — biến đó còn điều khiển giá metering, và bật nó từng làm MỘT
+    lần suy luận kibble bị tính 2 FLOP thay vì 0.001 (chi phồng, không phải mua thêm)."""
+    if budget is not None:
+        budget = _dec(budget)
+        if budget is None or budget <= 0:
+            return None
+    else:
+        budget = daily_budget(token, ledger_path)
     if budget is None:
         return None
     now = int(now if now is not None else time.time())
     token = _token(token)
     rec = _rec_for(_load(path), token, now)
-    spent_today = _dec(rec.get("spent_today", "0")) or Decimal(0)
+    spent_today = _spent_today(rec, token, now, ledger_path)
 
     # mục tiêu tuyến tính tới thời điểm này = budget * (giây đã trôi trong ngày / 86400)
     target = budget * Decimal(_seconds_into_day(now)) / Decimal(86400)
     due = target - spent_today
     if due <= 0:
         return "0"
-    cap = max_per_run()
+    cap = max_per_run(budget)
     if cap is not None and due > cap:
         due = cap
     due = _apply_jitter(due, rng)                    # chống sybil: phá nhịp tuyến tính robot
@@ -174,13 +249,14 @@ def record_spend(amount, token: str = None, now: int = None, path: str = None) -
     _save(state, path)
 
 
-def pacing_status(token: str = None, now: int = None, path: str = None) -> dict:
+def pacing_status(token: str = None, now: int = None, path: str = None,
+                  ledger_path: str = None) -> dict:
     """Ảnh chụp nhịp hôm nay (để log/telemetry): ngân sách, đã chi, mục tiêu, đến hạn."""
-    budget = daily_budget()
+    budget = daily_budget(token, ledger_path)
     now = int(now if now is not None else time.time())
     token = _token(token)
     rec = _rec_for(_load(path), token, now)
-    spent = _dec(rec.get("spent_today", "0")) or Decimal(0)
+    spent = _spent_today(rec, token, now, ledger_path)
     target = (budget * Decimal(_seconds_into_day(now)) / Decimal(86400)) if budget else Decimal(0)
     return {
         "token": token, "enabled": budget is not None,
@@ -188,5 +264,6 @@ def pacing_status(token: str = None, now: int = None, path: str = None) -> dict:
         "spent_today": _fmt(spent), "target_now": _fmt(target),
         # Telemetry: báo lượng đến hạn TRƯỚC jitter (rng=0.5 -> hệ số 1.0) để status
         # ổn định/đọc được; jitter chỉ áp ở lần chi thật qua next_spend_amount().
-        "next_due": next_spend_amount(token, now, path, rng=lambda: 0.5),
+        "next_due": next_spend_amount(token, now, path, rng=lambda: 0.5,
+                                      ledger_path=ledger_path),
     }

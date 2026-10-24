@@ -233,3 +233,221 @@ def test_requester_empty_pool_posts_nothing():
                                 log=lambda *_: None, gen=lambda: "kdddddddddd")
     assert posts == [] and rs["posted"] == [] and rs["would_post"] == []
     assert "kibble_requested" not in st
+
+
+# --- vân tay / chống job gần trùng (thuần) --------------------------------------------
+
+_TPL = ("Review whether posting many ATTEST lines with distinct job_id but identical reason "
+        "templates would hit technocore dupe_filter (5 copies per 60s). Tape lines sampled=200.")
+
+
+def test_job_fingerprint_is_normalized_word_set():
+    fp = k.job_fingerprint("Ed25519  Signature Sizes!", "How LARGE is a signature?")
+    assert fp == sorted(set(fp))                      # sorted + không trùng
+    assert "ed25519" in fp and "large" in fp          # hạ chữ thường, bỏ dấu câu
+    # thứ tự từ không đổi vân tay
+    assert k.job_fingerprint("a b", "c") == k.job_fingerprint("c b", "a")
+
+
+def test_similarity_bounds():
+    a = k.job_fingerprint("one time pad", "perfect secrecy")
+    assert k.similarity(a, a) == 1.0
+    assert k.similarity(a, k.job_fingerprint("gas fees", "rollup finality")) == 0.0
+    assert k.similarity(a, []) == 0.0 and k.similarity([], []) == 0.0
+
+
+def test_template_family_is_near_duplicate_but_distinct_jobs_are_not():
+    # 4 job cùng template, chỉ khác hậu tố id (đúng thứ quan sát được trên board)
+    a = k.job_fingerprint("Review dupe-filter risk for validator attests (mvbmaxua-2)", _TPL)
+    b = k.job_fingerprint("Review dupe-filter risk for validator attests (mvbmc37c-2)", _TPL)
+    assert k.similarity(a, b) >= 0.85
+    c = k.job_fingerprint("Explain the one-time pad",
+                           "Why is perfect secrecy impractical to deploy at scale?")
+    assert k.similarity(a, c) < 0.85
+    recent = k.remember_fingerprint([], a, now_ms=1_000)
+    assert k.is_near_duplicate(b, recent, 0.85, now_ms=1_000) is True
+    assert k.is_near_duplicate(c, recent, 0.85, now_ms=1_000) is False
+
+
+def test_is_near_duplicate_disabled_at_zero_threshold():
+    a = k.job_fingerprint("same", "same body")
+    assert k.is_near_duplicate(a, [a], 0.0) is False     # 0 = tắt hẳn
+    assert k.is_near_duplicate([], [a], 0.85) is False   # vân tay rỗng -> không chặn
+
+
+def test_remember_fingerprint_caps_and_dedupes():
+    recent = []
+    for i in range(k.DUP_KEEP + 10):
+        recent = k.remember_fingerprint(recent, k.job_fingerprint(f"job {i}", "body"))
+    assert len(recent) == k.DUP_KEEP
+    fp = k.job_fingerprint("job 0", "body")
+    once = k.remember_fingerprint(k.remember_fingerprint(recent, fp), fp)
+    assert sum(1 for r in once if r["fp"] == fp) == 1           # không nhân bản
+    assert once[0]["fp"] == fp                                  # mới nhất lên đầu
+
+
+def test_remember_fingerprint_is_pure():
+    recent = [k.job_fingerprint("a", "b")]
+    snapshot = [list(x) for x in recent]
+    k.remember_fingerprint(recent, k.job_fingerprint("c", "d"))
+    assert recent == snapshot                                   # không sửa đầu vào
+
+
+# --- HẠN SỐNG của vân tay (sửa lỗi chặn vĩnh viễn làm throughput về 0) ----------------
+
+_H = 3600 * 1000
+
+
+def test_fingerprint_expires_after_ttl():
+    """Chặn trả lời CẢ LOẠT trong một đợt, KHÔNG cấm vĩnh viễn một template."""
+    a = k.job_fingerprint("Review dupe-filter risk (mvbmaxua-2)", _TPL)
+    b = k.job_fingerprint("Review dupe-filter risk (mvbmc37c-2)", _TPL)
+    recent = k.remember_fingerprint([], a, now_ms=0)
+    ttl = 6 * _H
+    assert k.is_near_duplicate(b, recent, 0.85, now_ms=1 * _H, ttl_ms=ttl) is True   # trong hạn
+    assert k.is_near_duplicate(b, recent, 0.85, now_ms=7 * _H, ttl_ms=ttl) is False  # hết hạn
+
+
+def test_zero_ttl_never_expires():
+    a = k.job_fingerprint("x", _TPL)
+    recent = k.remember_fingerprint([], a, now_ms=0, ttl_ms=0)
+    assert k.is_near_duplicate(a, recent, 0.85, now_ms=999 * _H, ttl_ms=0) is True
+
+
+def test_legacy_bare_list_entries_are_treated_as_expired():
+    """State cũ (list trần, không mốc) chính là thứ đã khoá cứng throughput -> phải
+    KHÔNG còn chặn nữa, và bị dọn ở lần ghi kế tiếp."""
+    now = 1_790_000_000_000                        # mốc epoch ms thật (prod luôn >> ttl)
+    a = k.job_fingerprint("x", _TPL)
+    legacy = [a]                                   # định dạng trước khi có timestamp: ts=0
+    assert k.is_near_duplicate(a, legacy, 0.85, now_ms=now) is False
+    out = k.remember_fingerprint(legacy, k.job_fingerprint("y", "khác hẳn"), now_ms=now)
+    assert all(isinstance(r, dict) for r in out) and len(out) == 1
+
+
+def test_remember_prunes_expired_entries():
+    old = k.remember_fingerprint([], k.job_fingerprint("cũ", _TPL), now_ms=0)
+    out = k.remember_fingerprint(old, k.job_fingerprint("mới", "nội dung khác"),
+                                 now_ms=7 * _H, ttl_ms=6 * _H)
+    assert len(out) == 1 and out[0]["fp"] == k.job_fingerprint("mới", "nội dung khác")
+
+
+def test_entries_keep_their_own_timestamp():
+    r = k.remember_fingerprint([], k.job_fingerprint("a", "b"), now_ms=5_000)
+    r = k.remember_fingerprint(r, k.job_fingerprint("c", "d"), now_ms=9_000)
+    assert [x["ts"] for x in r] == [9_000, 5_000]
+
+
+# --- lọc gần-trùng LÚC CHỌN (đợt job toàn một họ không được đốt hết quota) -------------
+
+def _job_msg(seq, jobid, title, body, jtype="explain"):
+    return {"seq": seq, "from": "did:key:zSomeoneElse",
+            "text": f"JOB v1 | {jobid} | {jtype} | {title} | {body}"}
+
+
+def _burst_then_distinct():
+    """Mô phỏng board thật: 1 requester nhả 6 job CÙNG HỌ (mới nhất), rồi 3 job khác hẳn."""
+    msgs = []
+    for i in range(6):
+        msgs.append(_job_msg(1000 + i, "k%010x" % (i + 1),
+                             f"Review dupe-filter risk (mvbo1fuy-{i})", _TPL))
+    for i, (t, b) in enumerate([
+            ("One-time pad perfect secrecy", "Why is it impractical to deploy at scale?"),
+            ("Solana SVM account locking", "How does parallel transaction scheduling work?"),
+            ("PostgreSQL covering index", "When does an index-only scan actually trigger?")]):
+        msgs.append(_job_msg(900 + i, "k%010x" % (100 + i), t, b))
+    return msgs
+
+
+def test_select_jobs_digs_past_a_single_family_burst():
+    """Đây CHÍNH LÀ lỗi làm throughput về 0: 5 job mới nhất toàn một họ. Lọc lúc chọn phải
+    lấy 1 đại diện của họ rồi ĐÀO TIẾP xuống các job khác, không trả về đợt toàn trùng."""
+    picked = k.select_jobs(_burst_then_distinct(), set(), ["explain"], 5,
+                           recent_fps=[], dup_sim=0.85, now_ms=1_000)
+    assert len(picked) == 4                       # 1 đại diện họ + 3 job khác nhau
+    titles = [p["title"] for p in picked]
+    assert sum(1 for t in titles if "dupe-filter" in t) == 1
+    assert len(set(titles)) == 4
+
+
+def test_select_jobs_unchanged_when_dup_filter_off():
+    picked = k.select_jobs(_burst_then_distinct(), set(), ["explain"], 5, dup_sim=0)
+    assert len(picked) == 5                       # hành vi cũ: 5 job mới nhất, kể cả trùng
+    assert all("dupe-filter" in p["title"] for p in picked)
+
+
+def test_select_jobs_skips_family_already_answered_recently():
+    recent = k.remember_fingerprint(
+        [], k.job_fingerprint("Review dupe-filter risk (mvbmaxua-2)", _TPL), now_ms=1_000)
+    picked = k.select_jobs(_burst_then_distinct(), set(), ["explain"], 5,
+                           recent_fps=recent, dup_sim=0.85, now_ms=1_000)
+    assert all("dupe-filter" not in p["title"] for p in picked)      # họ đã làm -> bỏ qua
+    assert len(picked) == 3                                          # còn 3 job khác
+
+
+def test_select_jobs_takes_family_again_after_ttl():
+    recent = k.remember_fingerprint(
+        [], k.job_fingerprint("Review dupe-filter risk (mvbmaxua-2)", _TPL), now_ms=0)
+    late = 7 * 3600 * 1000
+    picked = k.select_jobs(_burst_then_distinct(), set(), ["explain"], 5,
+                           recent_fps=recent, dup_sim=0.85, now_ms=late,
+                           ttl_ms=6 * 3600 * 1000)
+    assert sum(1 for p in picked if "dupe-filter" in p["title"]) == 1   # hết hạn -> làm lại
+
+
+# --- trim_to_sentence: không chặt ngang chữ (bài cụt "...a heap fetch f") -------------
+def _long(n_sentences=40, tail=" Use a composite index to perform a heap fetch f"):
+    return ("Composite indexes reduce random IO for range scans. " * n_sentences) + tail
+
+
+def test_trim_short_text_unchanged():
+    assert k.trim_to_sentence("  A short answer.  ", 1200) == "A short answer."
+
+
+def test_trim_ends_on_complete_sentence_not_mid_word():
+    s = _long()
+    assert len(s) > 1200
+    out = k.trim_to_sentence(s, 1200)
+    assert len(out) <= 1200 and out.endswith("scans.")
+    assert not s[:1200].endswith(".")                      # bản cắt cứng cũ thì cụt
+
+
+def test_trim_drops_dangling_list_marker_after_sentence():
+    s = ("Latency bounds hold for each region. " * 40) + "4. Next step continues here"
+    cap = s.index("4.") + 2                                # cắt ngay sau "4."
+    out = k.trim_to_sentence(s, cap)
+    assert out.endswith("region.") and not out.endswith("4.")
+
+
+def test_trim_keeps_a_real_number_ending_a_sentence():
+    s = ("x " * 300) + "The answer is 4. " + ("word " * 300)
+    cap = s.index("4.") + 2
+    assert k.trim_to_sentence(s, cap).endswith("is 4.")
+
+
+def test_trim_decimal_is_not_a_sentence_end():
+    s = ("word " * 300) + "Version 3.5 adds support for" + (" more words" * 50)
+    out = k.trim_to_sentence(s, len(s) - 20)
+    assert not out.endswith("3.")
+
+
+def test_trim_without_sentence_end_cuts_on_word_and_marks_it():
+    s = "word " * 400
+    out = k.trim_to_sentence(s, 1200)
+    assert len(out) <= 1201 and out.endswith("…") and out[:-1].endswith("word")
+
+
+
+def test_one_failing_job_does_not_abort_the_batch():
+    msgs = [{"seq": 10 + i, "from": "did:key:zR", "text": f"JOB v1 | k000000000{i} | explain | t{i} | body {i} different words here"}
+            for i in range(3)]
+    st, posts = {}, []
+
+    def answer(job):
+        if job["jobid"].endswith("2"):
+            raise RuntimeError("boom")
+        return "a real answer."
+    out = k.run_kibble_worker(fetch_fn=lambda since: {"messages": msgs, "last_seq": 12}, answer_fn=answer,
+                               post_fn=lambda t: posts.append(t) or True, state=st,
+                               allow_types=["explain"], max_per_run=3, do_claim=True, dry_run=False)
+    assert len(out["delivered"]) == 2 and out["skipped"] == 1

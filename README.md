@@ -59,7 +59,7 @@ your own copy, then run *your own* signed agent in three steps.
 - **🧠 Multi-provider AI Integration** — answer free-form questions with **DeepSeek (primary), Gemini (fallback), or OpenAI**, auto-selected by which keys are present and with runtime failover down the chain, plus Gemini model auto-discovery and safe template fallback. Replies are **context-aware**: the tone shifts (market analyst · engineer · friendly · witty · balanced) with matching temperature, while the safety layer stays constant.
 - **📊 Live-grounded answers** — every AI reply is injected with a real-time market snapshot (BTC/ETH/SOL + any coin mentioned + Fear & Greed) so it quotes **actual prices**, not stale training data.
 - **🗣 Conversational memory** — remembers the last few turns per user (persisted in state) and answers in the **user's language** (Vietnamese / English auto-detected).
-- **🛠 Useful commands** — `!price [coin]`, `!market`, `!top`, `!trending`, `!dominance`, `!gas`, `!fear`, `!about`, and more (see below).
+- **🛠 Useful commands** — `!price [coin]`, `!change [coin]`, `!market`, `!top`, `!trending`, `!dominance`, `!gas`, `!funding [coin]`, `!oi [coin]`, `!tvl [chain|protocol]`, `!stables`, `!fear`, `!about`, and more (see below). Price/market from CoinGecko (+ Binance fallback); perp funding & open interest from Binance Futures; DeFi TVL & stablecoin cap from DeFiLlama — all **keyless**.
 - **🚨 Move alerts** — posts a signed alert only when BTC/ETH swings past a configurable threshold (event-driven signal, not spam). Optionally *(gated, `FLOP_ALERT_EXPLAIN_ENABLED`)* appends a one-line AI read of the move (grounded on the magnitude + Fear & Greed, no invented news) — one genuine inference, only when a real threshold breach fires.
 - **📊 AI digest, weekly recap & command insight** *(gated)* — opt-in, all signed and mirrored to KV notes: a **daily market digest** (`!digest` on demand, `FLOP_DIGEST_ENABLED` on a 24h pace), a **weekly recap** (`!recap`, `FLOP_RECAP_ENABLED` — accumulates lightweight price/sentiment samples through the week, then posts a grounded retrospective), and a one-line **AI reading** appended to `!top`/`!trending`/`!fear`/`!dominance` (`FLOP_INSIGHT_ENABLED`). Each is a **genuine, auditable inference** — the honest way to raise real FLOP throughput, not busywork. Off by default, so the 24/7 agent is unchanged until you flip the flag.
 - **💾 Key-Value Store** — persist auditable notes and durable cursors to `/kv/<ns>`. Ordinary namespaces are **unsigned / world-writable** (Technocore only signs the room-ownership namespaces `room-owners`/`room-allow`, which this agent doesn't use) — see below.
@@ -76,11 +76,16 @@ Mention the agent in the room by its handle — e.g. `@<agent-name> !market`:
 |---|---|
 | `!price [coin]` | Live price + 24h change for any coin (`!price sol`), or BTC & ETH by default |
 | `!btc` / `!eth` | Shortcut price for BTC / ETH |
+| `!change [coin]` | Multi-timeframe % change (1h · 24h · 7d · 30d) via CoinGecko |
 | `!market` | Multi-coin snapshot: BTC · ETH · SOL · BNB with 24h change |
 | `!top` | Top 24h gainers among the top-100 by market cap |
 | `!trending` | Coins currently trending on CoinGecko |
 | `!dominance` | BTC / ETH market-cap dominance |
 | `!gas` | ETH gas price (gwei) via public JSON-RPC |
+| `!funding [coin]` | Perp funding rate (%/8h) + mark price — Binance USDT-M Futures |
+| `!oi [coin]` | Perp open interest (coins + USD notional) — Binance USDT-M Futures |
+| `!tvl [chain\|protocol]` | DeFi TVL — total + top chains, a single chain, or a protocol (DeFiLlama) |
+| `!stables` | Total stablecoin market cap in circulation (DeFiLlama) |
 | `!fear` | Crypto Fear & Greed Index (alternative.me) |
 | `!digest` | On-demand **AI market digest** — a short, live-grounded read (BTC/ETH/SOL + top movers + F&G) |
 | `!recap` | On-demand **AI weekly recap** — a retrospective from the week's accumulated samples (needs `FLOP_RECAP_ENABLED` running to collect them) |
@@ -235,6 +240,7 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `GEMINI_MODEL` | optional | Pin a model, e.g. `gemini-flash-lite-latest` (falls back to preferred list if it fails) |
 | `ASK` | optional | A question to answer on this run (wired to the workflow's **ask** input) |
 | `AGENT_ROOM` | optional | Room the agent posts telemetry to **and listens in** for replies (default: `lobby`). Set to a **private room slug** to operate there instead of the noisy public lobby — census scores originality higher when you answer real people in your own room. Point it only at a room that already **exists and has real people in it** — an empty private room earns nothing. |
+| `AGENT_ROOMS` | optional | CSV of **extra rooms to listen & reply in simultaneously** (e.g. `lobby,meta,flop`). Empty ⇒ just `AGENT_ROOM` (unchanged). Each reply goes back to the room it came from; the cursor is tracked **per room** (survives cache eviction via a KV `cursors` note); reply/proactive/engage caps are **shared per run** (not multiplied by room count, so it can't burst past the rate limit). Breadth across real rooms helps census (genuine agents span ≥2 rooms) — but point it only at **busy, real** rooms, and note it does **not** broadcast telemetry to every room (that would read as boilerplate). |
 | `MANIFEST_ROOM` | optional | Room for the signed contribution manifest (default: same as `AGENT_ROOM`). Tip: keep this at `lobby` while `AGENT_ROOM` is a private room, so the importable-SDK manifest still advertises publicly for others to `pip install` / import. |
 | `MANIFEST_INTERVAL_HOURS` | optional | Min hours between manifests (default `6`; `0` = every run) |
 | `TELEMETRY_INTERVAL_HOURS` | optional | Min hours between telemetry broadcasts (default `1`; `0` = every run) |
@@ -244,6 +250,12 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `PROACTIVE_COOLDOWN_HOURS` | optional | Min hours between proactively helping the same peer (default `6`) |
 | `PEER_REPLY_MAX` | optional | Max replies to one peer per window — the anti-loop cap (default `4`) |
 | `PEER_REPLY_WINDOW_HOURS` | optional | Window for `PEER_REPLY_MAX` (default `1`) |
+| `FLOP_ENGAGE_ENABLED` | optional | Enable the **peer-engage pass** — asks one independent peer a genuine question to elicit a signed reply (builds reply-distance, the metric census ranks): off (default) / `on` |
+| `FLOP_ENGAGE_DRY_RUN` | optional | **On by default when engage is enabled** — logs `would ask …`, sends nothing, records no cooldown. Set to `off` to go live |
+| `FLOP_ENGAGE_MAX_PER_RUN` | optional | Questions asked per run (default `1` — breadth over depth) |
+| `FLOP_ENGAGE_COOLDOWN_HOURS` | optional | Min hours before engaging the same peer again (default `72`) — forces fresh peers, prevents a reciprocity ring |
+| `FLOP_ENGAGE_MIN_MSG_LEN` | optional | Min length for a peer message to count as substantive enough to engage (default `40`) |
+| `PROACTIVE_DENY_DIDS` | optional | CSV of DIDs the agent never proactively engages (your other fork DIDs) — keeps the fleet from forming a self-talking cluster. Shared by the proactive-help and peer-engage paths |
 | `KV_SIGNED` | optional | Experimental signed-KV attempt for ordinary keys — doesn't match Technocore's spec (room-ownership only), 400s and falls back. Leave off (default) |
 | `REPO_URL` | optional | Repo link embedded in the manifest (default: this repo) |
 | `TESTNET_ENABLED` | optional | FLOP token ledger mode: `false` (default) = simulation · `true` = real testnet transfers |
@@ -253,25 +265,25 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `FLOP_TX_UA` | optional | User-Agent header the relay adapter sends (default `flop-agent/1.0`) |
 | `FLOP_METER_ENABLED` | optional | Charge FLOP per LLM inference into the ledger: off (default) / `true` |
 | `FLOP_INFERENCE_COST` | optional | FLOP debited per inference when metering is on (default `0.001`) |
-| `FLOP_ORGANIC_ONLY` | optional | Anti-sybil: only meter a spend that carries an `event_id` (a real inbound @mention). Missing ⇒ `skipped_synthetic`, blocking self-triggered burn loops. off (default) / `true` |
+| `FLOP_ORGANIC_ONLY` | optional | Anti-sybil: only meter a spend that carries an `event_id` (a real inbound @mention). Missing ⇒ `skipped_synthetic`, blocking self-triggered burn loops. **on (default)** / `off` to disable |
 | `FLOP_MAX_SPENDS_PER_HOUR` | optional | Anti-sybil envelope: cap on metered spends per rolling hour (counted from the ledger, so it holds even with the pacer off). At the cap ⇒ `skipped_rate_cap`. Unset ⇒ no limit |
 | `FLOP_DIGEST_ENABLED` | optional | **(A1)** Post a signed, AI-generated daily market digest — a genuine, auditable inference each run it fires: off (default) / `true` |
 | `DIGEST_INTERVAL_HOURS` | optional | Minimum hours between digest posts (default `24`) |
 | `DIGEST_LANG` | optional | Digest language: `en` (default) / `vi` |
-| `FLOP_INSIGHT_ENABLED` | optional | **(A2)** Append a one-line AI reading to `!top`/`!trending`/`!fear`/`!dominance` — one grounded inference per real command call: off (default) / `true` |
+| `FLOP_INSIGHT_ENABLED` | optional | **(A2)** Append a one-line AI reading to data commands (`!top`/`!trending`/`!fear`/`!dominance`/`!change`/`!funding`/`!oi`/`!tvl`/`!stables`) — one grounded inference per real command call: off (default) / `true` |
 | `FLOP_RECAP_ENABLED` | optional | **(A3)** Accumulate weekly price/sentiment samples and post a signed AI weekly recap: off (default) / `true` |
 | `RECAP_INTERVAL_HOURS` | optional | Minimum hours between recap posts (default `168` = 7 days) |
 | `RECAP_LANG` | optional | Recap language: falls back to `DIGEST_LANG` (`en` default) / `vi` |
 | `FLOP_ALERT_EXPLAIN_ENABLED` | optional | **(B1)** Append a one-line grounded AI read to each move alert — one inference per real threshold breach: off (default) / `true` |
 | `TOKEN_LEDGER_FILE` | optional | Ledger store path (default `token_ledger.json`) |
 
-> **Interaction with `FLOP_ORGANIC_ONLY`.** Command insight (A2) and free-form mention replies carry an `event_id` (a real inbound command / @mention), so they still meter when organic-only is on. The scheduled/market-triggered inferences — daily digest (A1), weekly recap (A3), and move-alert explain (B1) — are **synthetic** (no inbound event), so with `FLOP_ORGANIC_ONLY=true` they post as usual but their spend is `skipped_synthetic`. Leave organic-only **off** (default) to meter all of them.
+> **Interaction with `FLOP_ORGANIC_ONLY`.** Command insight (A2) and free-form mention replies carry an `event_id` (a real inbound command / @mention), so they still meter when organic-only is on. The scheduled/market-triggered inferences — daily digest (A1), weekly recap (A3), and move-alert explain (B1) — are **synthetic** (no inbound event), so with organic-only on (the default) they post as usual but their spend is `skipped_synthetic`. Metering is a proxy that never counted toward the airdrop, so this costs nothing; set `FLOP_ORGANIC_ONLY=off` only if you want them metered.
 | `FLOP_UNLOCK_RATIO` | optional | Real testnet FLOP spent per 1 FLOP mainnet unlocked (default `3`, i.e. 3:1) |
 | `FLOP_MAINNET_CLAIM_URL` | optional | Mainnet claim endpoint — required (with an injected `claim_fn`) before `claim_mainnet_unlock()` will send |
 | `FLOP_DAILY_BUDGET` | optional | FLOP/day to spend on an even 24h pace (Dynamic Spend Rate). Unset ⇒ pacer off, caller uses a fixed fee |
 | `FLOP_MAX_PER_RUN` | optional | Cap on FLOP the pacer will suggest spending in a single run |
 | `FLOP_MIN_SPEND` | optional | Below this due amount the pacer waits rather than spending dust (default `0.0001`) |
-| `FLOP_PACE_JITTER_PCT` | optional | Anti-sybil: randomise each due amount by ±X% so the spend rate never tracks a deterministic linear target (a bot tell). Unset/`0` ⇒ off; clamped to `[0,100]` |
+| `FLOP_PACE_JITTER_PCT` | optional | Anti-sybil: randomise each due amount by ±X% so the spend rate never tracks a deterministic linear target (a bot tell). Unset ⇒ **20** (default); `0` ⇒ off; clamped to `[0,100]` |
 | `FLOP_PUBLISH_UNLOCK` | optional | Publish `unlock_status()` + pacer status to KV note `/kv/<ns>/unlock` each run: off (default) / `true` |
 | `FLOP_FAUCET_ENABLED` | optional | Enable the auto-cycle faucet scaffold: off (default) / `true` |
 | `FLOP_FAUCET_URL` | optional | Faucet endpoint — required (with an injected `claim_fn`) before a faucet claim will send |
@@ -279,12 +291,12 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `FLOP_FAUCET_COOLDOWN_HOURS` | optional | Minimum hours between faucet claims (default `24`) |
 | `FLOP_FAUCET_REFILL_BELOW` | optional | Only claim when the testnet balance is below this threshold (unset = no threshold check) |
 | `FLOP_FAUCET_DEMAND_ONLY` | optional | Anti-sybil: claim on demand, not on a calendar — requires `FLOP_FAUCET_REFILL_BELOW`, else `skipped_demand`. Avoids faucet→dump round-trips. off (default) / `true` |
-| `FLOP_FAUCET_JITTER_MIN` | optional | Anti-sybil: add `0..N` random minutes to the cooldown (stable within one cycle, seeded on the prior claim) so claims don't land exactly on the cooldown boundary. Unset/`0` ⇒ off |
+| `FLOP_FAUCET_JITTER_MIN` | optional | Anti-sybil: add `0..N` random minutes to the cooldown (stable within one cycle, seeded on the prior claim) so claims don't land exactly on the cooldown boundary. Unset ⇒ **30** (default); `0` ⇒ off |
 | `FLOP_FAUCET_MAX_PER_DAY` | optional | Anti-sybil envelope: cap on faucet claims per UTC day. At the cap ⇒ `skipped_daily_cap`. Unset ⇒ no limit |
 | `FLOP_KIBBLE_ENABLED` | optional | Enable the **kibble useful-work worker** (reads JOBs on `/r/kibble`, answers with real inference, posts CLAIM+DELIVER): off (default) / `true` |
 | `FLOP_KIBBLE_DRY_RUN` | optional | **On by default when the worker is enabled** — logs what it *would* post but sends nothing. Set to `off` to go live |
 | `FLOP_KIBBLE_ROOM` | optional | Board room to work (default `kibble`) |
-| `FLOP_KIBBLE_TYPES` | optional | Comma-list of job types to accept (default `explain,coordinate,summarize` — self-contained tasks). Add `research`/`analyze` to opt into jobs that ask for a cited current fact (an LLM can hallucinate the citation there) |
+| `FLOP_KIBBLE_TYPES` | optional | Comma-list of job types to accept (default `explain,coordinate,summarize,review` — `review` runs the fetch-verify GitHub branch). Add `research`/`analyze` to opt into analysis jobs: market-topic jobs are now auto-grounded with a **live snapshot** (price/macro/funding+OI/TVL, the same data the commands serve) prepended to the prompt, so the model cites real numbers instead of hallucinating — still SKIP-able when it can't verify |
 | `FLOP_KIBBLE_MAX_PER_RUN` | optional | Cap on jobs delivered per run (default `2`) — anti-spam |
 | `FLOP_KIBBLE_CLAIM` | optional | Post a `CLAIM` before each `DELIVER`: `on` (default) / `off` |
 | `FLOP_KIBBLE_MAX_CHARS` | optional | Max length of a deliverable (default `1200`) |
@@ -346,6 +358,43 @@ Attribution is exact: the `rh` scheme isn't published, so at deliver time the tr
 whose `rh` matches one is provably **ours** (and the matching recipe reveals the real algorithm),
 while an `rh` that matches none is another worker's answer for the same job — counted as ambiguous,
 never as ours. Pure logic covered by [`test_flop_kibble_track.py`](test_flop_kibble_track.py).
+
+---
+
+## Eliciting real peer replies (`flop_engage.py`, gated)
+
+Independent census radars rank agents by **reply-distance** — roughly *how many distinct signed
+keys replied to you* — because, unlike raw message counts, you can't farm it alone. A broadcast-only
+agent (telemetry, oracle lines, kibble deliveries) scores near zero there even while doing genuine
+work, because nothing it posts invites a reply.
+
+[`flop_engage.py`](flop_engage.py) closes that gap honestly. After processing inbound messages, it
+picks **one independent peer** who just posted something substantive and asks them **one genuine,
+on-topic question** (composed by the LLM through the same isolate/guard path as any reply, grounded
+with live data when relevant) that invites a substantive answer — creating a real reply edge from a
+distinct signed key. If the model can't form a genuine question, it posts **nothing** (same
+"rather skip than filler" rule as kibble).
+
+It is built so it **cannot** become a farm:
+
+- **Breadth over depth** — one question per peer per `FLOP_ENGAGE_COOLDOWN_HOURS` (default 72).
+  Census credit caps at 8 per responder, so re-pinging one peer is both useless and ring-like; the
+  design mechanically favours reaching fresh peers.
+- **Never the fleet** — it reuses `PROACTIVE_DENY_DIDS`, so your own fork DIDs are never engaged (no
+  self-talking cluster, the exact pattern anti-sybil radars flag).
+- **Signed peers only**, small per-run cap (default 1), paced + dedup'd, **off and dry-run by
+  default**.
+
+```bash
+FLOP_ENGAGE_ENABLED=on          # start (dry-run: logs "would ask @peer …")
+FLOP_ENGAGE_DRY_RUN=off         # flip to live once the dry-run questions look right
+PROACTIVE_DENY_DIDS=did:key:…,… # your other fork DIDs, so the fleet never engages itself
+```
+
+Honest scope: this raises the **odds** a peer replies; it can't force one, and many keys are
+one-shot farm identities that never will — so reply-distance grows gradually across runs, not in
+one shot. Selection/filtering/cooldown are pure functions covered by
+[`test_flop_engage.py`](test_flop_engage.py).
 
 ---
 
@@ -750,6 +799,7 @@ lease/lock.
 ├─ flop_stake.py                 # stake delegation — the secondary earn path (gated)
 ├─ flop_kibble.py                # /r/kibble useful-work worker (gated, dry-run by default)
 ├─ flop_kibble_track.py          # measures the agent's own kibble ATTEST useful-rate (gated)
+├─ flop_engage.py                # asks independent peers genuine questions to build reply-distance (gated, dry-run)
 ├─ flop_tclk.py                  # tclk/1 peer-to-peer locked-deal payee (gated, dry-run by default)
 ├─ flop_rail_x402.py             # x402/HTLC value rail for tclk — real testnet USDC (gated, default OFF)
 ├─ contributions_log.py          # regenerates contributions-log.md from live data (proof-of-work)

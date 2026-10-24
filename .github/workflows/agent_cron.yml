@@ -10,6 +10,11 @@ on:
         description: 'Hỏi agent (để trống nếu chỉ chạy telemetry). VD: @gia ETH tuan nay? hoặc !price'
         required: false
         default: ''
+      force_broadcast:
+        description: 'Ép đăng telemetry NGAY (chỉ để thử khi chạy tay). cron-job.org không tick ô này.'
+        required: false
+        type: boolean
+        default: false
 
 # Không cho 2 lần chạy chồng nhau (tránh trả lời trùng)
 concurrency:
@@ -24,7 +29,14 @@ permissions:
 
 jobs:
   run-agent:
-    runs-on: ubuntu-latest
+    # Ghim image: ubuntu-latest chuyển sang 26.04 dần từ 19/10 tới 19/11/2026 — đúng giữa
+    # ngày testnet 3/11. Không để môi trường chạy tự đổi vào hôm quan trọng nhất; job
+    # `lockfiles` trong CI kiểm sẵn trên 26.04 để đổi có chủ đích khi muốn.
+    runs-on: ubuntu-24.04
+    # Run thường ~1–2 phút (dài nhất đo được ~7,4 phút, faucet có thể chờ trong run ~10 phút).
+    # Mặc định GitHub là 6 GIỜ: một run treo sẽ giữ hàng đợi `concurrency` và mọi run sau
+    # phải chờ (~72 run lỡ). 20 phút là đủ rộng cho run thật, đủ ngắn để không mất nửa ngày.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5 (pinned to full SHA — chống tag bị repoint)
 
@@ -33,14 +45,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Bước sau chạy VỚI seed trong env -> chỉ cài đúng các bản đã khoá + khớp hash
+      # (requirements.lock). Bản mới bị đầu độc trên PyPI không lọt vào được. Không cần
+      # `pip install -e .`: agent chạy từ thư mục repo nên import trực tiếp các module.
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+        run: pip install --require-hashes --no-deps -r requirements.lock
 
       # Khôi phục state (cursor last_seq) từ lần chạy trước
       - name: Restore agent state
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4 (pinned)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0 (pinned, Node 24)
         with:
           path: state.json
           # key gồm cả run_attempt -> RE-RUN (giữ nguyên run_id) không trùng key với lần
@@ -49,6 +62,39 @@ jobs:
           key: technocore-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             technocore-state-
+
+      # Tự kiểm KÊNH CẢNH BÁO — chạy MỌI run. Vì sao cần: hai bước alert bên dưới chỉ chạy
+      # `if: failure()`, nên một secret thiếu/sai nằm im cho tới ĐÚNG lúc cần nó nhất (thực tế
+      # đã im suốt 200 run vì thiếu TELEGRAM_CHAT_ID). Gọi getMe — API chỉ ĐỌC, không gửi tin,
+      # không tác dụng phụ. KHÔNG BAO GIỜ in token/webhook, chỉ in TRẠNG THÁI.
+      - name: Alert channels self-check
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          tg="OFF (chưa đặt secret nào)"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || echo 000)
+            case "$code" in
+              200) tg="ON (token hợp lệ)" ;;
+              000) tg="FAIL (không gọi được api.telegram.org)" ;;
+              401|404) tg="FAIL (Telegram từ chối token — sai hoặc đã revoke)" ;;
+              *) tg="FAIL (HTTP $code)" ;;
+            esac
+          elif [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            tg="OFF (thiếu TELEGRAM_CHAT_ID)"
+          elif [ -n "$TELEGRAM_CHAT_ID" ]; then
+            tg="OFF (thiếu TELEGRAM_BOT_TOKEN)"
+          fi
+          dc="OFF (chưa đặt DISCORD_WEBHOOK_URL)"
+          [ -n "$DISCORD_WEBHOOK_URL" ] && dc="ON"
+          echo "[alert] telegram=${tg}  discord=${dc}"
+          # Hỏng, hoặc cấu hình DỞ DANG -> annotation để thấy ngay ở trang run, khỏi mở log.
+          case "$tg" in
+            FAIL*|*thiếu*) echo "::warning title=Kenh canh bao::telegram=${tg} — sua secret, neu khong su co that se khong ai bao" ;;
+          esac
 
       - name: Run signed agent
         env:
@@ -72,13 +118,26 @@ jobs:
           KV_NS: ${{ vars.KV_NS }}
           # LLM tùy chọn — thêm 1 secret là bot tự thông minh hơn. Bỏ trống tất cả ->
           # agent tự fallback về template (vẫn chạy bình thường). Ở chế độ auto, thứ tự
-          # ưu tiên là DeepSeek (chính) -> Gemini (phụ) -> OpenAI; provider chính lỗi lúc
-          # chạy sẽ tự lùi sang provider kế tiếp còn key.
+          # ưu tiên là Groq (chính) -> Gemini (phụ) -> DeepSeek -> OpenAI; provider chính lỗi
+          # lúc chạy sẽ tự lùi sang provider kế tiếp còn key.
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'auto' }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # SAN TẢI khi Groq hay 429: đổi thứ tự provider (CSV). Rỗng -> mặc định
+          # groq,gemini,openrouter,deepseek,openai. Vd dồn sang Gemini/OpenRouter:
+          #   LLM_PROVIDER_ORDER=gemini,openrouter,groq
+          LLM_PROVIDER_ORDER: ${{ vars.LLM_PROVIDER_ORDER }}
+          # Model OpenRouter (gateway nhiều model, có bản :free). Rỗng -> dùng mặc định trong code.
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          # Để trống -> tự dò model Groq hợp lệ trên key (Groq hay đổi/deprecate model).
+          # Ghim model cụ thể bằng cách đặt Variable GROQ_MODEL nếu muốn.
+          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-flash' }}
+          # Thinking mode của DeepSeek: mặc định TẮT ở agent; 'enabled' để bật.
+          DEEPSEEK_THINKING: ${{ vars.DEEPSEEK_THINKING }}
           # Ghim model đã chạy tốt -> bỏ qua bước tự dò (đổi qua Variable GEMINI_MODEL nếu muốn)
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-flash-lite-latest' }}
           # Kibble useful-work worker — mặc định TẮT. Bỏ trống các Variable dưới -> agent chạy
@@ -89,6 +148,23 @@ jobs:
           FLOP_KIBBLE_TYPES: ${{ vars.FLOP_KIBBLE_TYPES }}
           FLOP_KIBBLE_MAX_PER_RUN: ${{ vars.FLOP_KIBBLE_MAX_PER_RUN }}
           FLOP_KIBBLE_CLAIM: ${{ vars.FLOP_KIBBLE_CLAIM }}
+          # Ngưỡng coi 2 job là gần trùng (Jaccard 0..1) -> bỏ job sau, tránh loạt
+          # deliverable na ná nhau. Trống = 0.85. Đặt 0 để TẮT hẳn.
+          FLOP_KIBBLE_DUP_SIM: ${{ vars.FLOP_KIBBLE_DUP_SIM }}
+          # Vân tay chống-trùng hết hạn sau ngần này giờ (trống = 6). <=0 = không hết hạn.
+          FLOP_KIBBLE_DUP_HOURS: ${{ vars.FLOP_KIBBLE_DUP_HOURS }}
+          # Báo cáo CHI TIÊU FLOP định kỳ qua Telegram (mặc định TẮT). Dùng lại 2 secret
+          # Telegram của bước cảnh báo; agent chỉ ĐỌC chúng để gửi, không bao giờ log.
+          FLOP_DAILY_REPORT_ENABLED: ${{ vars.FLOP_DAILY_REPORT_ENABLED }}
+          FLOP_DAILY_REPORT_HOURS: ${{ vars.FLOP_DAILY_REPORT_HOURS }}
+          # Số ngày testnet dùng để DỰ PHÓNG tổng chi (trống = 90).
+          FLOP_TESTNET_DAYS: ${{ vars.FLOP_TESTNET_DAYS }}
+          # Ngày bắt đầu kỳ testnet 'YYYY-MM-DD' (trống = tính từ ngày chi đầu tiên).
+          FLOP_TESTNET_START: ${{ vars.FLOP_TESTNET_START }}
+          # Ngưỡng cảnh báo tập trung thợ đào (0..1, trống = 0.5). 0 = tắt cảnh báo.
+          FLOP_MINER_CONC_WARN: ${{ vars.FLOP_MINER_CONC_WARN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Tracker ATTEST (đo useful-rate của chính agent) — mặc định TẮT. Đặt
           # FLOP_KIBBLE_TRACK_ENABLED=true để publish note kibble-score + append vào log.
           FLOP_KIBBLE_TRACK_ENABLED: ${{ vars.FLOP_KIBBLE_TRACK_ENABLED }}
@@ -116,6 +192,10 @@ jobs:
           FLOP_POST_JITTER_MS: ${{ vars.FLOP_POST_JITTER_MS }}
           FLOP_POST_RETRY_429: ${{ vars.FLOP_POST_RETRY_429 }}
           FLOP_POST_RETRY_429_MAX_S: ${{ vars.FLOP_POST_RETRY_429_MAX_S }}
+          # Jitter khởi động: ngủ ngẫu nhiên 0..N giây đầu run -> chống LOCKSTEP giữa các runner/
+          # fork cùng nhịp (post lệch giờ nhau, giảm tín hiệu cluster). Mặc định 0 (tắt). Mỗi
+          # runner/fork đặt giá trị KHÁC nhau. Chạy trên GitHub Actions, không cần VPS.
+          FLOP_START_JITTER_MAX_SEC: ${{ vars.FLOP_START_JITTER_MAX_SEC }}
           # Auto-reply CHỌN LỌC (2 chiều): chào peer mới 1 lần + trả lời khi peer hỏi câu crypto
           # (LLM thật). Mặc định BẬT. Tăng tương tác để tích trục "được-trả-lời" của census, nhưng
           # GIỮ trần chống-loop: PEER_REPLY_MAX/PEER_REPLY_WINDOW_HOURS (mỗi peer) + COOLDOWN.
@@ -128,6 +208,24 @@ jobs:
           # Denylist DID cho CHỦ ĐỘNG (CSV) — không tự bắt chuyện với fork cùng gia-đình để
           # tránh radar anti-sybil gom thành cluster. Rỗng mặc định (template fork-agnostic).
           PROACTIVE_DENY_DIDS: ${{ vars.PROACTIVE_DENY_DIDS }}
+          # Room CHÍNH để ĐĂNG (broadcast/engage/status/digest). Mặc định "lobby" — firehose
+          # (~1000 tin/phút) nên tin trôi khỏi cửa sổ census (~200 tin ≈ 12s) -> agent gần như
+          # VÔ HÌNH với census snapshot. Đặt AGENT_ROOM=<room yên> (vd "flop" ~4 tin/phút, cửa sổ
+          # ~46 phút) để tin trụ trong khung + engage reply kịp "trong 5 tin". Giữ MANIFEST_ROOM
+          # =lobby để VẪN được tìm thấy ở room đông (quảng bá SDK/DID).
+          AGENT_ROOM: ${{ vars.AGENT_ROOM }}
+          MANIFEST_ROOM: ${{ vars.MANIFEST_ROOM }}
+          # Đa room: nghe/phản hồi đồng thời nhiều room (CSV, vd "lobby,meta,flop"). Rỗng ->
+          # chỉ AGENT_ROOM. Cursor theo từng room; cap reply/engage dùng chung toàn run.
+          AGENT_ROOMS: ${{ vars.AGENT_ROOMS }}
+          # Engage: chủ động hỏi 1 peer độc lập/run để sinh cạnh reply-distance (census).
+          # Bật FLOP_ENGAGE_ENABLED=on -> DRY-RUN (log 'would ask') tới khi FLOP_ENGAGE_DRY_RUN=off.
+          # Loại fork nhà qua PROACTIVE_DENY_DIDS (bắt buộc đặt trước khi go-live để không ring).
+          FLOP_ENGAGE_ENABLED: ${{ vars.FLOP_ENGAGE_ENABLED }}
+          FLOP_ENGAGE_DRY_RUN: ${{ vars.FLOP_ENGAGE_DRY_RUN }}
+          FLOP_ENGAGE_MAX_PER_RUN: ${{ vars.FLOP_ENGAGE_MAX_PER_RUN }}
+          FLOP_ENGAGE_COOLDOWN_HOURS: ${{ vars.FLOP_ENGAGE_COOLDOWN_HOURS }}
+          FLOP_ENGAGE_MIN_MSG_LEN: ${{ vars.FLOP_ENGAGE_MIN_MSG_LEN }}
           # tclk/1 payee (deal-making). Đặt FLOP_TCLK_ENABLED=on để bật (bật thì DRY-RUN — chỉ
           # log 'would ACCEPT', không post — cho tới khi đặt FLOP_TCLK_DRY_RUN=off). Module CHỈ
           # discover+accept, KHÔNG BAO GIỜ tự lock/reveal.
@@ -146,26 +244,150 @@ jobs:
           FLOP_TCLK_OFFER_JOB: ${{ vars.FLOP_TCLK_OFFER_JOB }}
           # Metering sổ cái FLOP (mặc định TẮT). Đo mỗi inference thật vào token_ledger.json (bền
           # qua KV). SIMULATION cho tới TESTNET_ENABLED=true. ORGANIC_ONLY / MAX_SPENDS_PER_HOUR /
-          # INFERENCE_COST là các van chống-sybil + đơn giá (tùy chọn).
+          # INFERENCE_COST là các van chống-sybil + đơn giá. ORGANIC_ONLY mặc định BẬT (đặt off để tắt).
           FLOP_METER_ENABLED: ${{ vars.FLOP_METER_ENABLED }}
           FLOP_ORGANIC_ONLY: ${{ vars.FLOP_ORGANIC_ONLY }}
           FLOP_INFERENCE_COST: ${{ vars.FLOP_INFERENCE_COST }}
           FLOP_MAX_SPENDS_PER_HOUR: ${{ vars.FLOP_MAX_SPENDS_PER_HOUR }}
-          # VOTER cho contest sonnet của FLOP Labs (mặc định TẮT). Đặt SONNET_VOTER_ENABLED=true
-          # -> agent đăng ký voter (contest sonnet-2 mặc định) rồi bỏ phiếu KHI đặt
-          # SONNET_BALLOT_ENTRY=<entry_id>. SONNET_CONTEST_ID/SONNET_REFEREE_DID để override.
-          SONNET_VOTER_ENABLED: ${{ vars.SONNET_VOTER_ENABLED }}
-          SONNET_CONTEST_ID: ${{ vars.SONNET_CONTEST_ID }}
-          SONNET_BALLOT_ENTRY: ${{ vars.SONNET_BALLOT_ENTRY }}
-          SONNET_REFEREE_DID: ${{ vars.SONNET_REFEREE_DID }}
+          # Hạt giống MÔ PHỎNG để chạy thử đường ống khi faucet thật chưa có spec.
+          # token_manager TỪ CHỐI CỨNG khi TESTNET_ENABLED bật -> không chạm sổ cái thật.
+          FLOP_SIM_CREDIT: ${{ vars.FLOP_SIM_CREDIT }}
+          # Nạp lại hạt giống mô phỏng khi số dư TỤT DƯỚI ngưỡng này (trống = 1% lượng nạp).
+          FLOP_SIM_CREDIT_BELOW: ${{ vars.FLOP_SIM_CREDIT_BELOW }}
+          # Trần số lần nạp hạt giống mô phỏng mỗi ngày UTC (trống = 1).
+          FLOP_SIM_CREDIT_MAX_PER_DAY: ${{ vars.FLOP_SIM_CREDIT_MAX_PER_DAY }}
+          # ── TESTNET EARNING SURFACE (settled-inference = đòn earn agent airdrop). Mặc định
+          #    TẮT/rỗng -> simulation, hành vi không đổi. Chỉ flip khi FLOP mở testnet + công bố
+          #    endpoint. (Trước đây các biến này CHƯA map -> set là no-op; nay đã map.)
+          TESTNET_ENABLED: ${{ vars.TESTNET_ENABLED }}
+          FLOP_TOKEN_SYMBOL: ${{ vars.FLOP_TOKEN_SYMBOL }}
+          FLOP_UNLOCK_RATIO: ${{ vars.FLOP_UNLOCK_RATIO }}
+          FLOP_RPC_URL: ${{ vars.FLOP_RPC_URL }}
+          FLOP_SUBMIT_URL: ${{ vars.FLOP_SUBMIT_URL }}
+          FLOP_MEMPOOL_URL: ${{ vars.FLOP_MEMPOOL_URL }}
+          FLOP_TX_MODE: ${{ vars.FLOP_TX_MODE }}
+          # Spend pacing/budget (van chống-sybil bổ sung; code có mặc định nếu rỗng)
+          FLOP_PACE_JITTER_PCT: ${{ vars.FLOP_PACE_JITTER_PCT }}
+          FLOP_DAILY_BUDGET: ${{ vars.FLOP_DAILY_BUDGET }}
+          # Trần MỖI LẦN chi. Nhận số tuyệt đối ('0.5') hoặc PHẦN TRĂM ngân sách ngày
+          # ('2%'). Dùng % để trần tự co giãn khi faucet đổi mức cấp.
+          FLOP_MAX_PER_RUN: ${{ vars.FLOP_MAX_PER_RUN }}
+          FLOP_MIN_SPEND: ${{ vars.FLOP_MIN_SPEND }}
+          # Session inference (mua compute có settle). FLOP_SESSION_ENABLED=on + MODEL_HASH khi mở.
+          FLOP_SESSION_ENABLED: ${{ vars.FLOP_SESSION_ENABLED }}
+          FLOP_SESSION_MODEL_HASH: ${{ vars.FLOP_SESSION_MODEL_HASH }}
+          # CHẠY THỬ: hash mô phỏng, CHỈ dùng khi TESTNET_ENABLED tắt. Bật testnet thì
+          # code TỪ CHỐI dùng nó (không để hash giả chạm mempool thật).
+          FLOP_SESSION_SIM_MODEL_HASH: ${{ vars.FLOP_SESSION_SIM_MODEL_HASH }}
+          FLOP_SESSION_SIM_MINERS: ${{ vars.FLOP_SESSION_SIM_MINERS }}
+          FLOP_SESSION_FLOPS: ${{ vars.FLOP_SESSION_FLOPS }}
+          FLOP_SESSION_MAX_LATENCY_MS: ${{ vars.FLOP_SESSION_MAX_LATENCY_MS }}
+          FLOP_SESSION_MAX_PER_RUN: ${{ vars.FLOP_SESSION_MAX_PER_RUN }}
+          # Ngân sách phiên: 'auto' = chi HẾT số khả dụng trong ngày, rải đều qua các run (pacer,
+          # kẹp FLOP_MAX_PER_RUN). Rỗng = cố định FLOP_SESSION_MAX_PER_RUN phiên/run như cũ.
+          FLOP_SESSION_BUDGET: ${{ vars.FLOP_SESSION_BUDGET }}
+          # Đường mua compute: 'gateway' = api.flop.network (đường FLOP công bố, flop_gateway.py);
+          # rỗng = scaffold mempool cũ. Testnet tắt -> chạy TẬP trên devnet, KHÔNG ghi sổ.
+          FLOP_SESSION_BACKEND: ${{ vars.FLOP_SESSION_BACKEND }}
+          # Ví FLOP (SS58, ed25519). Khuyên dùng secret riêng; hoặc FLOP_WALLET_USE_DID=on để
+          # dùng chính khoá DID của agent.
+          FLOP_WALLET_SEED_HEX: ${{ secrets.FLOP_WALLET_SEED_HEX }}
+          FLOP_WALLET_USE_DID: ${{ vars.FLOP_WALLET_USE_DID }}
+          FLOP_GATEWAY_URL: ${{ vars.FLOP_GATEWAY_URL }}
+          FLOP_GATEWAY_NETWORK: ${{ vars.FLOP_GATEWAY_NETWORK }}
+          FLOP_GATEWAY_PROMPTS: ${{ vars.FLOP_GATEWAY_PROMPTS }}
+          FLOP_GATEWAY_PURPOSE: ${{ vars.FLOP_GATEWAY_PURPOSE }}
+          FLOP_GATEWAY_MAX_CALLS_PER_RUN: ${{ vars.FLOP_GATEWAY_MAX_CALLS_PER_RUN }}
+          FLOP_GATEWAY_MAX_TOKENS: ${{ vars.FLOP_GATEWAY_MAX_TOKENS }}
+          FLOP_GATEWAY_MAX_WAIT_MS: ${{ vars.FLOP_GATEWAY_MAX_WAIT_MS }}
+          # Cảnh báo chi tụt lại: >PCT% cửa sổ trong >=ALERT_HOURS giờ -> Telegram (testnet).
+          FLOP_GATEWAY_LAG_PCT: ${{ vars.FLOP_GATEWAY_LAG_PCT }}
+          # Quota tăng từ mức này trở lên = faucet nạp (mở cửa sổ chi mới); ít hơn = hoàn tiền.
+          FLOP_GATEWAY_TOPUP_MIN: ${{ vars.FLOP_GATEWAY_TOPUP_MIN }}
+          FLOP_GATEWAY_LAG_ALERT_HOURS: ${{ vars.FLOP_GATEWAY_LAG_ALERT_HOURS }}
+          FLOP_GATEWAY_LAG_REALERT_HOURS: ${{ vars.FLOP_GATEWAY_LAG_REALERT_HOURS }}
+          FLOP_GATEWAY_MIN_TOKENS: ${{ vars.FLOP_GATEWAY_MIN_TOKENS }}
+          FLOP_GATEWAY_CALL_GAP_SEC: ${{ vars.FLOP_GATEWAY_CALL_GAP_SEC }}
+          FLOP_GATEWAY_RUN_INTERVAL_SEC: ${{ vars.FLOP_GATEWAY_RUN_INTERVAL_SEC }}
+          FLOP_GATEWAY_MARGIN_SEC: ${{ vars.FLOP_GATEWAY_MARGIN_SEC }}
+          # Trần FLOPs MỘT phiên (tùy chọn) — phiên to hơn tách thành nhiều phiên.
+          FLOP_SESSION_MAX_FLOPS: ${{ vars.FLOP_SESSION_MAX_FLOPS }}
+          # (testnet) Trần phiên chờ proof: đủ N thì ngừng đăng phiên mới (mặc định 3, 0 = tắt).
+          FLOP_SESSION_MAX_PENDING: ${{ vars.FLOP_SESSION_MAX_PENDING }}
+          # Cửa sổ (giờ) đếm phiên chờ proof cho trần trên — chặn tối đa chừng ấy giờ (mặc định 6).
+          FLOP_SESSION_PENDING_BLOCK_HOURS: ${{ vars.FLOP_SESSION_PENDING_BLOCK_HOURS }}
+          # Mạng ép phí cố định mỗi phiên -> đặt mức đó (rỗng = theo đơn giá).
+          FLOP_SESSION_FIXED_FEE: ${{ vars.FLOP_SESSION_FIXED_FEE }}
+          # Radar testnet chỉ đọc (mặc định BẬT, 1 giờ/lần): route/trang/trạng thái mới -> Telegram.
+          FLOP_TESTNET_RADAR: ${{ vars.FLOP_TESTNET_RADAR }}
+          FLOP_TESTNET_RADAR_HOURS: ${{ vars.FLOP_TESTNET_RADAR_HOURS }}
+          # Bộ canh chi thật (testnet): báo Telegram sau N run liền không có phiên spent_onchain.
+          FLOP_REAL_SPEND_ALERT_RUNS: ${{ vars.FLOP_REAL_SPEND_ALERT_RUNS }}
+          FLOP_REAL_SPEND_REALERT_HOURS: ${{ vars.FLOP_REAL_SPEND_REALERT_HOURS }}
+          # Phanh cứng số tin chat/phòng/ngày (mặc định BẬT). FLOP_POST_CAPS đè trần, vd 'flop=40,*=30'.
+          FLOP_POST_GOVERNOR: ${{ vars.FLOP_POST_GOVERNOR }}
+          FLOP_POST_CAPS: ${{ vars.FLOP_POST_CAPS }}
+          # Tính năng đăng tin phải có kết quả: tclk/engage quá thấp -> tự tạm dừng 7 ngày (mặc định BẬT).
+          FLOP_OUTCOME_GUARD: ${{ vars.FLOP_OUTCOME_GUARD }}
+          # Đa dạng hóa request (chống bot/sybil): jitter ±% flops/latency/fee + xoay model list.
+          # Mặc định 20 (code), kẹp 0..50. MODEL_HASH nhận NHIỀU hash (CSV/'|') để xoay vòng.
+          FLOP_SESSION_JITTER_PCT: ${{ vars.FLOP_SESSION_JITTER_PCT }}
+          # Faucet (xin test token để CÓ số dư mà chi). FLOP_FAUCET_ENABLED=on + URL khi mở.
+          FLOP_FAUCET_ENABLED: ${{ vars.FLOP_FAUCET_ENABLED }}
+          FLOP_FAUCET_URL: ${{ vars.FLOP_FAUCET_URL }}
+          # Định dạng thật faucet.flop.network: địa chỉ SS58 nhận + mức (quick|linked) + provider.
+          FLOP_FAUCET_ADDRESS: ${{ vars.FLOP_FAUCET_ADDRESS }}
+          FLOP_FAUCET_TIER: ${{ vars.FLOP_FAUCET_TIER }}
+          FLOP_FAUCET_PROVIDER: ${{ vars.FLOP_FAUCET_PROVIDER }}
+          FLOP_FAUCET_AMOUNT: ${{ vars.FLOP_FAUCET_AMOUNT }}
+          FLOP_FAUCET_COOLDOWN_HOURS: ${{ vars.FLOP_FAUCET_COOLDOWN_HOURS }}
+          FLOP_FAUCET_REFILL_BELOW: ${{ vars.FLOP_FAUCET_REFILL_BELOW }}
+          FLOP_FAUCET_DEMAND_ONLY: ${{ vars.FLOP_FAUCET_DEMAND_ONLY }}
+          FLOP_FAUCET_MAX_PER_DAY: ${{ vars.FLOP_FAUCET_MAX_PER_DAY }}
+          # Lượt faucet kế tiếp mở trong <= N giây thì chờ ngay trong run để claim đúng giờ (mặc định 300).
+          FLOP_FAUCET_WAIT_MAX_SEC: ${{ vars.FLOP_FAUCET_WAIT_MAX_SEC }}
+          FLOP_FAUCET_JITTER_MIN: ${{ vars.FLOP_FAUCET_JITTER_MIN }}
           # Câu hỏi nhập tay khi Run workflow (bỏ qua khi chạy theo cron)
           ASK: ${{ github.event.inputs.ask }}
+          # Chỉ ép telemetry khi TICK ô force_broadcast lúc chạy tay — KHÔNG suy từ event_name,
+          # vì nhịp chính (cron-job.org) cũng là workflow_dispatch.
+          FORCE_BROADCAST: ${{ github.event.inputs.force_broadcast }}
         run: python agent_cron.py
+
+      # Cảnh báo Discord khi run LỖI/outage (NHẸ, gated OFF nếu chưa đặt secret DISCORD_WEBHOOK_URL).
+      # Bắn trên MỌI failure (crash / timeout / outage-exit-1) kèm link log. Không bao giờ làm fail
+      # thêm job (|| true). Đặt secret: gh secret set DISCORD_WEBHOOK_URL --body "<webhook-url>".
+      - name: Discord alert on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$DISCORD_WEBHOOK_URL" ] && exit 0
+          MSG="🔴 Technocore agent: run LỖI/outage ($(date -u '+%Y-%m-%d %H:%MZ')). Log: $RUN_URL"
+          PAYLOAD=$(MSG="$MSG" python3 -c "import json,os;print(json.dumps({'content':os.environ['MSG']}))")
+          curl -s -m 15 -H 'Content-Type: application/json' -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL" >/dev/null || true
+
+      # Cảnh báo Telegram khi run LỖI/outage (NHẸ, gated OFF nếu chưa đặt 2 secret). Độc lập với
+      # Discord — bật kênh nào tùy bạn. Setup: tạo bot qua @BotFather -> TELEGRAM_BOT_TOKEN; lấy
+      # chat id (nhắn bot rồi xem api.telegram.org/bot<token>/getUpdates) -> TELEGRAM_CHAT_ID.
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
+          MSG="🔴 Technocore agent: run LỖI/outage ($(date -u '+%Y-%m-%d %H:%MZ')). Log: $RUN_URL"
+          curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" >/dev/null || true
 
       # Lưu lại state cho lần chạy kế tiếp (key duy nhất theo run_id -> luôn ghi mới)
       - name: Save agent state
         if: always()
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4 (pinned)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0 (pinned, Node 24)
         with:
           path: state.json
           key: technocore-state-${{ github.run_id }}-${{ github.run_attempt }}
