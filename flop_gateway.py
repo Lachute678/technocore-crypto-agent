@@ -503,8 +503,13 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
 
         def collect(prev_calls: int) -> dict:
             """Đọc biên nhận; ghi sổ (book_fn) MỖI biên nhận mới ĐÃ SETTLE theo settled_spend —
-            đúng thước đo "compute purchased in settled sessions". Dedupe theo request_id."""
-            seen = list(g.get("receipts_seen") or [])
+            đúng thước đo "compute purchased in settled sessions". Dedupe theo request_id.
+            Khoá còn nằm trong phản hồi thì KHÔNG bao giờ bị quên (cắt cứng 200 mục từng làm
+            biên nhận cũ của danh sách >200 bị ghi sổ lại mỗi run); khoá đã rời phản hồi giữ
+            thêm 200 mục gần nhất làm đệm; phản hồi rỗng/lỗi tạm thì giữ nguyên trí nhớ."""
+            prev = list(g.get("receipts_seen") or [])
+            seen = set(prev)
+            present = {}
             new, amt, hist = [], 0.0, {}
             try:
                 items, shape = receipts_detail(http, base, bearer)
@@ -515,14 +520,18 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                 hist[key] = hist.get(key, 0) + 1
                 k = _receipt_key(rc)
                 a = settled_amount(rc)
-                if a is None or k in seen:
+                if a is None:
                     continue
-                seen.append(k)
+                present[k] = None
+                if k in seen:
+                    continue
+                seen.add(k)
                 new.append(rc)
                 amt += a
                 if book_fn and a > 0:
                     book_fn(a, k[:80], str(rc.get("model") or model_id))
-            g["receipts_seen"] = seen[-200:]
+            if present:
+                g["receipts_seen"] = [k for k in prev if k not in present][-200:] + list(present)
             st = dict(g.get("stats") or {})
             st["receipts"] = int(st.get("receipts") or 0) + len(new)
             st["settled"] = round(float(st.get("settled") or 0) + amt, 6)

@@ -373,6 +373,24 @@ def test_only_settled_receipts_are_booked_once_even_when_they_settle_later():
     assert all(ref.startswith("req-") for _, ref in booked)
 
 
+def test_receipts_beyond_200_are_never_booked_twice():
+    fake, booked, state = FakeGateway(quota=0.0), [], {}
+    fake.receipts = [{"request_id": f"req-{i}", "state": "settled", "settled_spend": 1.0} for i in range(250)]
+
+    def run(t):
+        gw.run_step(state, agent_key=_key("22"), http=fake, now=NOW + t * 3600, prompts=["q"],
+                    expect_network="devnet", book_fn=lambda c, ref, m: booked.append(ref),
+                    sleep=lambda s: None, log=lambda *a: None)
+
+    run(0)
+    run(1)
+    fake.override[("GET", "/v1/keys/me/receipts")] = Resp(data={"receipts": []})   # phản hồi rỗng tạm thời
+    run(2)
+    del fake.override[("GET", "/v1/keys/me/receipts")]
+    run(3)
+    assert len(booked) == 250 and len(set(booked)) == 250
+
+
 def test_settled_amount_rules():
     assert gw.settled_amount({"state": "settled", "settled_spend": "6.5"}) == 6.5
     assert gw.settled_amount({"state": "pending", "settled_spend": 0}) is None
