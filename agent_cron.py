@@ -113,7 +113,7 @@ def _write_summary(lines) -> None:
     if not path:
         return
     try:
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception as e:
         print(f"[summary] không ghi được: {e}")
@@ -770,7 +770,7 @@ def short_nick(did: str) -> str:
 # --- State (cursor last_seq) lưu qua các lần cron chạy bằng actions/cache ---
 def load_state() -> dict:
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -782,7 +782,7 @@ def save_state(state: dict) -> None:
     try:
         merged = load_state()
         merged.update(state)
-        with open(STATE_FILE, "w") as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(merged, f)
     except Exception as e:
         print(f"[state] không lưu được: {e}")
