@@ -558,7 +558,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                               _env_num("FLOP_GATEWAY_RUN_INTERVAL_SEC", 300),
                               _env_num("FLOP_GATEWAY_MARGIN_SEC", 1800), topup)
         g["window"] = win
-        max_calls = max(1, int(_env_num("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)))
+        # Không gọi nhiều hơn số đề: 1 job trong hàng mà 2 lần gọi/run từng gửi cùng 1 đề 2 lần.
+        max_calls = max(1, min(int(_env_num("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)), len(prompts)))
         pp, pc = _price(model)
         # Trần token/lần: mặc định = giới hạn của model (đo devnet 2026-10-24: trần 1024 chỉ chi
         # được ~3.7k/20k quota trong 24h). Lần gọi vẫn được định cỡ theo phần đến hạn.

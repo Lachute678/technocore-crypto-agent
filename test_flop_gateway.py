@@ -391,6 +391,14 @@ def test_receipts_beyond_200_are_never_booked_twice():
     assert len(booked) == 250 and len(set(booked)) == 250
 
 
+def test_never_sends_the_same_prompt_twice_in_one_run():
+    fake = FakeGateway(expires_ms=SOON)
+    r = gw.run_step({}, agent_key=_key("22"), http=fake, now=NOW, prompts=["only-job"],
+                    expect_network="devnet", sleep=lambda s: None, log=lambda *a: None)
+    sent = [c[3]["messages"][0]["content"] for c in fake.calls if c[1] == "/v1/chat/completions"]
+    assert r["calls"] == 1 and sent == ["only-job"]
+
+
 def test_settled_amount_rules():
     assert gw.settled_amount({"state": "settled", "settled_spend": "6.5"}) == 6.5
     assert gw.settled_amount({"state": "pending", "settled_spend": 0}) is None
@@ -419,8 +427,8 @@ def test_calls_made_before_a_503_are_still_reported(monkeypatch):
                 return Resp(503, {"error": {"code": "provider_error", "message": ""}}, {"Retry-After": "1"})
         return real(method, url, headers=headers, json=json, timeout=timeout)
 
-    r = gw.run_step({}, agent_key=_key("22"), http=flaky, now=NOW, prompts=["q"], expect_network="devnet",
-                    sleep=lambda s: None, log=lambda *a: None)
+    r = gw.run_step({}, agent_key=_key("22"), http=flaky, now=NOW, prompts=["q1", "q2", "q3", "q4"],
+                    expect_network="devnet", sleep=lambda s: None, log=lambda *a: None)
     assert r["outcome"] == "rate_limited" and r["calls"] == 2 and r["spent"] == pytest.approx(1.8)
 
 
