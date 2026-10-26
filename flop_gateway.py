@@ -31,6 +31,7 @@ import base64
 import hashlib
 import math
 import os
+import random
 import re
 import time
 
@@ -206,6 +207,16 @@ def network_detail(http, base: str):
     return None, f"/health không có trường network (keys: {sorted(d)[:8]})"
 
 
+def network_matches(net: str, expect: str) -> bool:
+    """`/health` có thể ghi "flop-testnet-1" thay vì đúng "testnet": khớp khi từ khoá nằm trong
+    tên như một TỪ riêng (tách theo ký tự không phải chữ/số). "devnet" không bao giờ khớp
+    "testnet" và ngược lại -> chi devnet không bao giờ bị ghi vào sổ testnet."""
+    net, expect = str(net or "").strip().lower(), str(expect or "").strip().lower()
+    if not net or not expect:
+        return False
+    return net == expect or expect in re.split(r"[^a-z0-9]+", net)
+
+
 def network(http, base: str):
     """`network.network` ở <origin>/health hoặc None."""
     return network_detail(http, base)[0]
@@ -273,14 +284,24 @@ def chat(http, base: str, bearer: str, model: str, prompt: str, max_tokens: int,
 
 # --- nhịp chi: rải quota còn lại tới lúc hết hạn ----------------------------------------
 
-def horizon(now: int, expires_at_ms) -> int:
-    """Mốc phải chi hết: hạn của allowance (ms) nếu có, không thì cuối ngày UTC."""
+def epoch_s(v):
+    """Mốc thời gian -> giây. OpenAPI ghi `expires_at` là mili-giây; nếu mạng khác trả GIÂY
+    mà vẫn chia 1000 thì hạn rơi về năm 1970 -> bearer luôn "sắp hết hạn" -> đăng ký lại ví
+    MỌI lượt. Giá trị > 1e11 coi là mili-giây, ngược lại là giây. Rỗng/rác -> None."""
     try:
-        exp = int(float(expires_at_ms)) // 1000
-        if exp > now:
-            return exp
-    except (TypeError, ValueError):
-        pass
+        x = int(float(v))
+    except (TypeError, ValueError, OverflowError):    # số khổng lồ/vô cực từ phản hồi lạ
+        return None
+    if x <= 0 or x > 10**16:                           # quá năm ~2286 (ms) = rác, không phải hạn
+        return None
+    return x // 1000 if x > 10**11 else x
+
+
+def horizon(now: int, expires_at) -> int:
+    """Mốc phải chi hết: hạn của allowance nếu có (ms hoặc s), không thì cuối ngày UTC."""
+    exp = epoch_s(expires_at)
+    if exp and exp > now:
+        return exp
     return now - now % 86400 + 86400
 
 
@@ -325,11 +346,18 @@ def size_call(per_call: float, prompt_tokens: int, price_prompt: float, price_co
 
 
 def _price(model: dict):
+    """(giá/token prompt, giá/token completion, giá CỐ ĐỊNH/lần gọi). Giá cố định lấy từ
+    FLOP_GATEWAY_FIXED_PRICE (operator đặt khi FLOP công bố ở chỗ khác) hoặc `pricing.request`
+    (trường OpenRouter). Devnet 2026-10-24 chỉ tính theo token; testnet có thể khác."""
     p = (model or {}).get("pricing") or {}
-    try:
-        return float(p.get("prompt") or 0), float(p.get("completion") or 0)
-    except (TypeError, ValueError):
-        return 0.0, 0.0
+
+    def num(v):
+        try:
+            return max(0.0, float(v or 0))
+        except (TypeError, ValueError):
+            return 0.0
+    fixed = num(os.environ.get("FLOP_GATEWAY_FIXED_PRICE", "").strip()) or num(p.get("request"))
+    return num(p.get("prompt")), num(p.get("completion")), fixed
 
 
 def _completion_cap(model: dict, default: int) -> int:
@@ -341,6 +369,20 @@ def _completion_cap(model: dict, default: int) -> int:
             except (TypeError, ValueError):
                 continue
     return default
+
+
+TOK_BAD_TTL = 86400                    # quên cỡ bị từ chối sau 1 ngày (miner có thể đã khoẻ hơn)
+
+
+def probe_up(tok_cap: int, cap: int, tok_bad, tok_bad_ts, now: int) -> int:
+    """Cỡ thử tiếp sau một chuỗi thành công. Không bao giờ nhảy thẳng về trần model: trước
+    đây 12 lần ổn định -> bỏ trần -> gửi 8192 -> bị từ chối -> hạ 4096 -> 2048 -> 1024, mất 3
+    lượt mỗi chu kỳ (~mỗi giờ trên devnet). Tăng tối đa 25%, và nếu đã biết cỡ bị từ chối
+    (trong 1 ngày) thì chỉ thử tới giữa khoảng [cỡ đang chạy, cỡ bị từ chối)."""
+    nxt = min(cap, int(tok_cap * 1.25))
+    if tok_bad and now - int(tok_bad_ts or 0) < TOK_BAD_TTL and nxt >= int(tok_bad):
+        nxt = (tok_cap + int(tok_bad)) // 2
+    return max(tok_cap, nxt)
 
 
 def _receipt_key(r: dict) -> str:
@@ -439,10 +481,34 @@ def lag_status(g: dict, now: int, outcome: str, *, pct: float, alert_hours: floa
     return line, alert, None
 
 
+def report_line(g: dict, now: int):
+    """Một dòng cho báo cáo ngày: quota còn, đã chi so với mục tiêu tới giờ, biên nhận đã settle,
+    kết quả lượt gần nhất. Báo cáo cũ chỉ biết bộ chia `flop_pacer` -> trên testnet (gateway)
+    dòng nhịp biến mất. None nếu gateway chưa chạy lần nào."""
+    if not isinstance(g, dict) or not g.get("last_run"):
+        return None
+    parts = [f"mạng {g.get('network') or '?'}"]
+    win = g.get("window") if isinstance(g.get("window"), dict) else None
+    if win and win.get("total"):
+        total, spent = float(win["total"]), float(win.get("spent") or 0)
+        start = int(win.get("start") or now)
+        end = int(win.get("horizon") or now) - int(_env_num("FLOP_GATEWAY_MARGIN_SEC", 1800))
+        frac = 1.0 if end <= start else min(1.0, max(0.0, (now - start) / (end - start)))
+        target = total * frac
+        pct = int(spent / target * 100) if target > 0 else 100
+        parts.append(f"đã chi {spent:.2f}/{target:.2f} mục tiêu ({pct}%)")
+    if g.get("remaining") is not None:
+        parts.append(f"quota còn {float(g['remaining']):.2f}")
+    st = g.get("stats") or {}
+    parts.append(f"biên nhận settle {int(st.get('receipts') or 0)} ({float(st.get('settled') or 0):.2f} FLOP)")
+    parts.append(f"lượt cuối: {g.get('last_outcome', '?')}")
+    return " · ".join(parts)
+
+
 # --- một nhịp ---------------------------------------------------------------------------
 
 def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_network: str,
-             book_fn=None, sleep=time.sleep, log=print) -> dict:
+             book_fn=None, sleep=time.sleep, log=print, rng=None) -> dict:
     """Một nhịp mua compute. Trả {"outcome", "calls", "spent", ...}; KHÔNG ném lỗi.
 
     `book_fn(amount, ref, model)` ghi sổ (chỉ khi mạng khớp `expect_network`); None = chạy
@@ -450,11 +516,20 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
     hạn, mốc chờ (Retry-After), biên nhận đã thấy, thống kê."""
     g = state.get(KEY) if isinstance(state.get(KEY), dict) else {}
     g = dict(g)
+    # Đổi gateway/mạng (vd tập devnet -> testnet thật): bắt đầu SẠCH. Không thì lịch nghỉ, cửa
+    # sổ chi, bearer, cỡ yêu cầu và biên nhận của mạng cũ (vd "chờ 1h" sau 403 hết hạn devnet)
+    # kẹt sang mạng mới — lượt đầu testnet có thể đứng chờ tới 1 giờ.
+    profile = f"{base_url()}|{expect_network}"
+    if g and g.get("profile") != profile:
+        log(f"[gateway] đổi sang {profile} — bỏ trạng thái của {g.get('profile') or 'mạng cũ'}")
+        g = {}
+    g["profile"] = profile
     out = {"outcome": "?", "calls": 0, "spent": 0.0}
     calls, spent = 0, 0.0                    # giữ được cả khi lần gọi sau lỗi (báo đúng số đã gọi)
 
     def done(outcome, **kw):
         out.update(outcome=outcome, **kw)
+        g["last_outcome"], g["last_run"] = outcome, now
         state[KEY] = g
         return out
 
@@ -473,7 +548,7 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
     if net is None:
         return done("error_network", reason=f"không đọc được /health của gateway ({why})")
     g["network"] = net
-    if net != expect_network:
+    if not network_matches(net, expect_network):
         return done("network_mismatch", reason=f"gateway báo '{net}', cần '{expect_network}' — không chi")
 
     def backoff(sec, why):
@@ -481,7 +556,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
 
     try:
         bearer = open_bearer(agent_key, g.get("vault"))
-        if bearer and g.get("expires_at") and int(float(g["expires_at"])) // 1000 <= now + 120:
+        exp_s = epoch_s(g.get("expires_at"))
+        if bearer and exp_s and exp_s <= now + 120:
             bearer = None                                     # sắp hết hạn -> enroll lại (không hạn -> giữ)
         if not bearer:
             e = enroll(http, base, wkey, _env("FLOP_GATEWAY_PURPOSE") or None)
@@ -496,42 +572,49 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
         model_id = g.get("model")
         models = catalog(http, base)
         if model_id not in models:
-            # Key gắn với 1 model; model rời catalog -> không gửi slug không được quảng bá.
+            # Key gắn với 1 model; model rời catalog -> không gửi slug không được quảng bá. Bỏ
+            # bearer + model để lượt sau ĐĂNG KÝ LẠI: gateway có thể cấp model khác còn sống
+            # ("catalog drift may choose another compatible model"). Trước đây chỉ nghỉ 30
+            # phút rồi gặp lại đúng lỗi này -> kẹt mãi, không chi gì.
+            g.pop("vault", None)
+            g.pop("model", None)
+            g.pop("tok_cap", None)
+            g.pop("tok_bad", None)
             backoff(1800, "model_not_advertised")
-            return done("model_unavailable", reason=f"model {model_id} không còn trong catalog")
+            return done("model_unavailable",
+                        reason=f"model {model_id} không còn trong catalog — sẽ đăng ký lại ví ở lượt sau")
         model = models[model_id]
 
         def collect(prev_calls: int) -> dict:
             """Đọc biên nhận; ghi sổ (book_fn) MỖI biên nhận mới ĐÃ SETTLE theo settled_spend —
-            đúng thước đo "compute purchased in settled sessions". Dedupe theo request_id.
-            Khoá còn nằm trong phản hồi thì KHÔNG bao giờ bị quên (cắt cứng 200 mục từng làm
-            biên nhận cũ của danh sách >200 bị ghi sổ lại mỗi run); khoá đã rời phản hồi giữ
-            thêm 200 mục gần nhất làm đệm; phản hồi rỗng/lỗi tạm thì giữ nguyên trí nhớ."""
-            prev = list(g.get("receipts_seen") or [])
-            seen = set(prev)
-            present = {}
+            đúng thước đo "compute purchased in settled sessions". Dedupe theo request_id."""
+            seen = list(g.get("receipts_seen") or [])
             new, amt, hist = [], 0.0, {}
             try:
                 items, shape = receipts_detail(http, base, bearer)
             except GatewayError as e:
                 items, shape = [], f"HTTP {e.status} {e.code}".strip()
+            live = {_receipt_key(rc) for rc in items}
             for rc in items:
                 key = f"{rc.get('state')}/{rc.get('response_status')}"
                 hist[key] = hist.get(key, 0) + 1
                 k = _receipt_key(rc)
                 a = settled_amount(rc)
-                if a is None:
+                if a is None or k in seen:
                     continue
-                present[k] = None
-                if k in seen:
-                    continue
-                seen.add(k)
+                seen.append(k)
                 new.append(rc)
                 amt += a
                 if book_fn and a > 0:
                     book_fn(a, k[:80], str(rc.get("model") or model_id))
-            if present:
-                g["receipts_seen"] = [k for k in prev if k not in present][-200:] + list(present)
+            # Nhớ MỌI biên nhận gateway còn trả (cắt cứng 200 mục từng có thể quên một biên nhận
+            # vẫn nằm trong phản hồi -> ghi sổ lần hai) + tối đa 200 cái đã rời phản hồi.
+            # Phản hồi rỗng/lỗi -> KHÔNG cắt gì (lần sau gateway trả đủ thì không ghi trùng).
+            if live:
+                gone = [k for k in seen if k not in live]
+                g["receipts_seen"] = gone[-200:] + [k for k in seen if k in live]
+            else:
+                g["receipts_seen"] = seen[-5000:]
             st = dict(g.get("stats") or {})
             st["receipts"] = int(st.get("receipts") or 0) + len(new)
             st["settled"] = round(float(st.get("settled") or 0) + amt, 6)
@@ -558,9 +641,27 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                               _env_num("FLOP_GATEWAY_RUN_INTERVAL_SEC", 300),
                               _env_num("FLOP_GATEWAY_MARGIN_SEC", 1800), topup)
         g["window"] = win
-        # Không gọi nhiều hơn số đề: 1 job trong hàng mà 2 lần gọi/run từng gửi cùng 1 đề 2 lần.
-        max_calls = max(1, min(int(_env_num("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)), len(prompts)))
-        pp, pc = _price(model)
+        # Nhịp mua bớt máy móc (như flop_pacer): thỉnh thoảng nghỉ cả lượt và co giãn phần đến
+        # hạn ±FLOP_PACE_JITTER_PCT. Phần không chi được TÍCH sang lượt sau (window_due cộng
+        # dồn) nên tổng chi trong ngày không đổi. Sát hạn thì không nghỉ, để kịp chi hết.
+        rnd = rng or random.random
+        interval = _env_num("FLOP_GATEWAY_RUN_INTERVAL_SEC", 300)
+        near_end = hz - _env_num("FLOP_GATEWAY_MARGIN_SEC", 1800) - now <= 3 * interval
+        if not near_end and rnd() * 100 < _env_num("FLOP_GATEWAY_SKIP_PCT", 10):
+            return done("pace_wait", due=round(due, 6), remaining=remaining, **rs,
+                        reason="nghỉ ngẫu nhiên lượt này (nhịp mua bớt đều đặn) — phần đến hạn dồn sang lượt sau")
+        jit = max(0.0, min(50.0, _env_num("FLOP_PACE_JITTER_PCT", 20))) / 100
+        if jit and not near_end:
+            due = min(float(remaining), due * (1 + (rnd() * 2 - 1) * jit))
+        max_calls = max(1, int(_env_num("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)))
+        pp, pc, preq = _price(model)
+        if pp <= 0 and pc <= 0 and preq <= 0:
+            # Không biết giá -> KHÔNG đoán và KHÔNG im lặng chờ mãi: báo rõ, thử lại sau 30 phút.
+            backoff(1800, "price_unknown")
+            return done("price_unknown", remaining=remaining, **rs,
+                        reason=(f"catalog không có giá cho {model_id} (pricing keys: "
+                                f"{sorted((model.get('pricing') or {}))[:8]}) — đặt FLOP_GATEWAY_FIXED_PRICE "
+                                "nếu FLOP công bố giá cố định/lần gọi"))
         # Trần token/lần: mặc định = giới hạn của model (đo devnet 2026-10-24: trần 1024 chỉ chi
         # được ~3.7k/20k quota trong 24h). Lần gọi vẫn được định cỡ theo phần đến hạn.
         cap = _completion_cap(model, int(_env_num("FLOP_GATEWAY_MAX_TOKENS", 0)) or 8192)
@@ -568,10 +669,13 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
         min_tok = int(_env_num("FLOP_GATEWAY_MIN_TOKENS", 64))
         gap = _env_num("FLOP_GATEWAY_CALL_GAP_SEC", 31)        # allowance: 2 yêu cầu/phút
         idx = int(g.get("prompt_idx") or 0)
-        pick = [prompts[(idx + i) % len(prompts)] for i in range(max_calls)]
+        # Mỗi lần gọi một đề KHÁC: ít đề hơn số lần gọi thì gọi ít lần hơn, không lặp đề.
+        pick = [prompts[(idx + i) % len(prompts)] for i in range(min(max_calls, len(prompts)))]
         est = estimate(http, base, model_id, pick[0], cap)
         ptok = int(est.get("estimated_input_tokens") or len(pick[0]) // 4)
-        min_cost = ptok * pp + min_tok * pc
+        # Giá cố định/lần gọi: số lần gọi quyết định số chi; cỡ yêu cầu không làm đổi giá nên
+        # dùng cỡ lớn nhất miner còn nhận (tok_cap học được) — cùng giá, nhiều compute hơn.
+        min_cost = preq + ptok * pp + min_tok * pc
         if due < min_cost or min_cost <= 0:
             return done("pace_wait", due=round(due, 6), remaining=remaining, **rs,
                         reason=f"đến hạn {due:.4f} < giá tối thiểu 1 lần gọi {min_cost:.4f} — tích sang run sau")
@@ -584,13 +688,19 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                 ptok = int(est.get("estimated_input_tokens") or len(prompt) // 4)
             # Cỡ được miner nhận học dần: devnet 2026-10-24 từ chối 8192 token ("no admitted miner
             # for model and budget" — ước tính 82 block, quá max_wait), nhận 1024.
-            mt = size_call(per_call, ptok, pp, pc, min(cap, int(g.get("tok_cap") or cap)), min_tok)
+            size_cap = min(cap, int(g.get("tok_cap") or cap))
+            if pc > 0:
+                mt = size_call(per_call - preq, ptok, pp, pc, size_cap, min_tok)
+            else:
+                mt = size_cap if per_call >= preq + ptok * pp else None
             if mt is None:
                 break
             if calls:
                 sleep(gap)
             g["last_mt"] = mt
-            r = chat(http, base, bearer, model_id, prompt, mt, max_cost=per_call * 1.1,
+            # Trần do gateway giữ = giá dự tính của CHÍNH lần gọi này (+10%), không phải cả phần đến hạn.
+            est_cost = preq + ptok * pp + mt * pc
+            r = chat(http, base, bearer, model_id, prompt, mt, max_cost=min(per_call, est_cost) * 1.1,
                      max_wait_ms=max_wait)
             u = r.get("usage") or {}
             cost, src = float(u.get("cost_flop") or 0), "usage"
@@ -613,11 +723,11 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                 # Không có cost_flop lẫn quota giảm -> KHÔNG ghi sổ theo ước tính; in khoá thật.
                 last["usage_keys"] = sorted(u)[:10]
                 log(f"[gateway] ⚠️ không xác định được số đã chi (usage keys: {last['usage_keys']})")
-            if g.get("tok_cap"):                       # ổn định 12 lần liền -> thử cỡ lớn hơn 25%
+            if g.get("tok_cap"):                       # ổn định 12 lần liền -> thử cỡ lớn hơn
                 g["tok_ok"] = int(g.get("tok_ok") or 0) + 1
                 if g["tok_ok"] >= 12:
-                    g["tok_cap"] = min(cap, int(g["tok_cap"] * 1.25)) if g["tok_cap"] * 1.25 < cap else None
-                    g["tok_ok"] = 0
+                    g["tok_cap"], g["tok_ok"] = probe_up(int(g["tok_cap"]), cap, g.get("tok_bad"),
+                                                         g.get("tok_bad_ts"), now), 0
             # Ghi tiến độ NGAY sau mỗi lần chi: lỗi ở lần gọi sau không làm mất số đã chi.
             g["remaining"] = max(0.0, min(quota_now, remaining - spent))
             g["window"] = {**g["window"], "spent": float(g["window"].get("spent") or 0) + cost}
@@ -654,7 +764,10 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                         reason=f"403 {e.code} {e.message}".strip())
         if e.status == 503 and "no admitted miner" in e.message.lower() and g.get("last_mt"):
             # Không miner nào nhận yêu cầu CỠ này -> lần sau gửi nửa cỡ (không phải mạng quá tải).
-            g["tok_cap"] = max(int(_env_num("FLOP_GATEWAY_MIN_TOKENS", 64)) * 2, int(g["last_mt"]) // 2)
+            bad = int(g["last_mt"])
+            if not g.get("tok_bad") or bad < int(g["tok_bad"]):
+                g["tok_bad"], g["tok_bad_ts"] = bad, now      # cỡ NHỎ NHẤT từng bị từ chối
+            g["tok_cap"] = max(int(_env_num("FLOP_GATEWAY_MIN_TOKENS", 64)) * 2, bad // 2)
             g["tok_ok"] = 0
             backoff(60, "no_admitted_miner")
             return done("no_miner", reason=f"503 {e.code}: {e.message[:120]} — lần sau tối đa {g['tok_cap']} token")

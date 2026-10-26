@@ -1251,6 +1251,15 @@ def _post_caps() -> dict:
     return flop_governor.parse_caps(os.environ.get("FLOP_POST_CAPS", ""))
 
 
+def room_capped(room: str) -> bool:
+    """Phòng đã hết hạn mức đăng hôm nay (governor)? Hết hạn mức KHÔNG phải lỗi đường ghi:
+    bài đăng định kỳ bỏ qua tới ngày UTC mới, không báo "fail" và không gõ lại mỗi lượt."""
+    if not POST_GOVERNOR:
+        return False
+    import flop_governor as _gov
+    return _gov.is_capped(_post_gov_state, room, _post_caps(), time.time())
+
+
 def post_message(private_key, did, text, room=ROOM) -> bool:
     if POST_GOVERNOR:
         import flop_governor as _gov
@@ -1806,6 +1815,13 @@ def maybe_send_daily_report(state: dict, now: int, extras: dict = None) -> bool:
             pass
         # Rút gọn CHỈ cho tin nhắn — log Actions và job summary giữ bản đầy đủ.
         extras = dict(extras or {})
+        try:                                  # đường mua compute THẬT (gateway): nhịp + quota + biên nhận
+            import flop_gateway
+            _gl = flop_gateway.report_line(state.get(flop_gateway.KEY) or {}, now)
+            if _gl:
+                extras["gateway"] = _gl
+        except Exception:
+            pass
         if extras.get("kibble"):
             extras["kibble"] = fr.compact_kibble(extras["kibble"])
         try:                                  # dự phóng CHI qua kỳ testnet
@@ -1847,7 +1863,9 @@ def persist_ledger_to_kv(private_key, did) -> None:
                 "spend_count_by_hour": led.get("spend_count_by_hour", {}),
                 "credit_by_hour": led.get("credit_by_hour", {}),
                 "first_spend_day": led.get("first_spend_day"),
-                "unlock": led.get("unlock", {})}
+                "unlock": led.get("unlock", {}),
+                # Dấu băm biên nhận gateway đã ghi -> cache mất vẫn không ghi trùng.
+                "gateway_refs": (led.get("gateway_refs") or [])[-100:]}
         entries = (led.get("entries", []) or [])
         body = None
         # Cắt dần tới khi VỪA giới hạn. Số dư và các tổng chạy không suy từ entries, nên
@@ -1945,6 +1963,8 @@ def _link_allowed(url: str) -> bool:
 
 
 def scrub_links_and_addresses(text: str) -> str:
+    if not isinstance(text, str):
+        return text
     text = _URL_RE.sub(lambda m: m.group(0) if _link_allowed(m.group(0)) else "[link removed]", text)
     text = _BARE_DOMAIN_RE.sub(lambda m: m.group(0) if _link_allowed(m.group(0)) else "[link removed]", text)
     text = _EVM_ADDR_RE.sub("[address removed]", text)
@@ -3173,11 +3193,16 @@ def _mempool_submit_fn(req: dict) -> dict:
     }
 
 
+_faucet_default_addr = None          # địa chỉ SS58 của VÍ gateway (DID) — faucet_step đặt mỗi run
+
+
 def _faucet_body(req: dict):
     """Thân yêu cầu faucet. Có FLOP_FAUCET_ADDRESS -> định dạng THẬT của faucet.flop.network
     (`POST /fund {"address": <SS58>}`; mức verified: + tier=linked, provider=brightid|self).
     Không có -> payload ký kiểu cũ của scaffold. Trả (body, flop_format)."""
-    addr = os.environ.get("FLOP_FAUCET_ADDRESS", "").strip()
+    # Trống -> dùng chính VÍ gateway (cùng tài khoản mua compute; ngày testnet không phải đặt
+    # thêm biến). Không có ví -> payload ký kiểu scaffold cũ như trước.
+    addr = os.environ.get("FLOP_FAUCET_ADDRESS", "").strip() or (_faucet_default_addr or "")
     if not addr:
         return (req.get("signed") or {}), False
     if not ss58_valid(addr):
@@ -3222,6 +3247,8 @@ def _faucet_claim_fn(req: dict) -> dict:
     (flop_faucet.run_faucet_cycle bắt -> error_claim)."""
     url = req.get("faucet_url")
     body, flop_format = _faucet_body(req)
+    if flop_format and re.match(r"(?i)^https?://[^/]+/?$", url or ""):
+        url = url.rstrip("/") + "/fund"          # FLOP_FAUCET_URL chỉ có tên miền -> endpoint /fund
     r = requests.post(url, json=body,
                       headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=20)
     if r.status_code == 429:
@@ -3230,14 +3257,24 @@ def _faucet_claim_fn(req: dict) -> dict:
             body = r.json() if r.content else {}
         except ValueError:
             body = {}
-        wait = _faucet_retry_after(r.headers.get("Retry-After"), body if isinstance(body, dict) else {})
+        wait = _faucet_retry_after(r.headers.get("Retry-After"), body if isinstance(body, dict) else {}, True)
         return {"amount": 0, "retry_after_s": wait if wait is not None else 3600}
-    r.raise_for_status()
-    data = r.json() if r.content else {}
+    try:
+        data = r.json() if r.content else {}
+    except ValueError:
+        data = {}
     if not isinstance(data, dict):
         data = {}
-    _wait = _faucet_retry_after(None, data)
+    if r.status_code >= 400:
+        # Faucet từ chối với thời gian chờ trong câu chữ (400/403...): là "chưa tới lượt", KHÔNG
+        # phải lỗi — nếu coi là lỗi thì agent gõ lại mỗi giờ (~22 lần bị từ chối/ngày).
+        _wait = _faucet_retry_after(r.headers.get("Retry-After"), data, True)
+        if _wait is not None:
+            print(f"[faucet] chưa tới lượt (HTTP {r.status_code}) — chờ {_wait // 60} phút")
+            return {"amount": 0, "retry_after_s": _wait}
+        r.raise_for_status()
     err = _api_error(data)
+    _wait = _faucet_retry_after(None, data, bool(err))
     if err:
         if _wait is not None:                          # "chưa tới lượt, quay lại sau N giây"
             return {"amount": 0, "retry_after_s": _wait}
@@ -3261,8 +3298,23 @@ def _faucet_claim_fn(req: dict) -> dict:
     return out
 
 
-def _faucet_retry_after(header, body: dict):
-    """Số giây tới lượt claim kế tiếp từ header Retry-After hoặc thân phản hồi; None nếu không có."""
+FAUCET_WAIT_MAX = 2 * 86400            # chu kỳ faucet thật = 24h; hẹn xa hơn 2 ngày là rác
+
+
+def _faucet_retry_after(header, body: dict, text: bool = False):
+    """Như _faucet_retry_after_raw nhưng KẸP về [0, FAUCET_WAIT_MAX] và không bao giờ ném lỗi:
+    "thử lại sau 999999 phút" hay số khổng lồ trước đây hoặc làm OverflowError, hoặc hẹn lượt
+    sau ~2 năm nữa = tắt faucet."""
+    try:
+        w = _faucet_retry_after_raw(header, body, text)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return None if w is None else max(0, min(int(w), FAUCET_WAIT_MAX))
+
+
+def _faucet_retry_after_raw(header, body: dict, text: bool = False):
+    """Số giây tới lượt claim kế tiếp từ header Retry-After hoặc thân phản hồi; None nếu không có.
+    `text=True` (CHỈ khi faucet từ chối) -> đọc cả thời gian chờ viết trong câu chữ."""
     if header is not None:
         try:
             return max(0, int(float(str(header).strip())))
@@ -3289,7 +3341,33 @@ def _faucet_retry_after(header, body: dict):
                 return max(0, int(t - time.time()))
             except ValueError:
                 continue
+    for k in (("error", "message", "detail", "reason") if text else ()):   # chờ viết trong CÂU CHỮ
+        w = _wait_from_text(body.get(k))
+        if w is not None:
+            return w
     return None
+
+
+_WAIT_UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "giây": 1,
+               "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60, "phút": 60,
+               "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "giờ": 3600}
+_WAIT_RE = re.compile(r"(?i)(?:in|after|sau|wait|retry|again)\D{0,20}?(\d{1,6}(?:\.\d+)?)\s*"
+                      r"(seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|giây|phút|giờ)\b")
+
+
+def _wait_from_text(text):
+    """Số giây chờ trong câu báo của faucet, vd devnet 2026-10-24: "This address was just
+    funded; try again in 1306 minutes" / "...thử lại sau 1306 phút". Không thấy -> None."""
+    if not isinstance(text, str) or not text:
+        return None
+    m = _WAIT_RE.search(text)
+    if not m:
+        return None
+    unit = m.group(2).lower()
+    mult = _WAIT_UNITS.get(unit) or _WAIT_UNITS.get(unit.rstrip("s"))
+    if not mult:
+        return None
+    return max(0, int(float(m.group(1)) * mult))
 
 
 def faucet_step(state: dict, private_key, did) -> str:
@@ -3324,6 +3402,25 @@ def faucet_step(state: dict, private_key, did) -> str:
             print("[faucet] bỏ qua — FLOP_FAUCET_ENABLED bật nhưng TESTNET_ENABLED tắt: "
                   "faucet thật chỉ chạy cùng sổ testnet (bật TESTNET_ENABLED trước).")
             return "skipped_simulation"
+        global _faucet_default_addr
+        try:
+            import flop_gateway
+            _wk = flop_gateway.wallet_key(private_key)
+            _faucet_default_addr = flop_gateway.wallet_address(_wk) if _wk else None
+        except Exception:
+            _faucet_default_addr = None
+        _env_addr = os.environ.get("FLOP_FAUCET_ADDRESS", "").strip()
+        if (_env_addr and _faucet_default_addr and _env_addr != _faucet_default_addr
+                and state.get("faucet_addr_warned") != _env_addr):
+            # Faucet nạp vào ví KHÁC ví mua compute -> gateway báo ví chưa có tiền, và chi tiêu
+            # (thứ được tính airdrop) nằm ở tài khoản khác. Có thể cố ý -> chỉ cảnh báo 1 lần.
+            _m = (f"⚠️ Faucet nạp vào {_env_addr[:8]}…{_env_addr[-4:]} nhưng ví mua compute (gateway) là "
+                  f"{_faucet_default_addr[:8]}…{_faucet_default_addr[-4:]}. Nếu không cố ý, xoá "
+                  "FLOP_FAUCET_ADDRESS để faucet tự dùng ví gateway.")
+            print(f"[faucet] {_m}")
+            if _telegram_send(_m):
+                state["faucet_addr_warned"] = _env_addr
+                save_state({"faucet_addr_warned": _env_addr})
         import flop_faucet
         fpath = flop_faucet.state_path()
         flop_faucet._save(flop_faucet.merge_state(flop_faucet._load(fpath), state.get("faucet_state")),
@@ -3346,6 +3443,10 @@ def faucet_step(state: dict, private_key, did) -> str:
                                               private_key=private_key, did=did)
         status = fr.get("outcome", "?")
         print(f"[faucet] {status}" + (f" — {fr['reason']}" if fr.get("reason") else ""))
+        if status == "claimed":
+            # Khoản nạp vừa vào sổ: lưu sổ cái NGAY (mốc "đã xin" lưu ở state.json ngay dưới đây;
+            # run chết trước persist cuối run thì sổ thiếu vĩnh viễn khoản nạp này).
+            persist_ledger_to_kv(private_key, did)
         state["faucet_state"] = flop_faucet._load(fpath)
         save_state({"faucet_state": state["faucet_state"]})
         return status
@@ -4152,7 +4253,7 @@ def start_jitter_seconds(raw, rng=None):
     return (rng or random).uniform(0, n)
 
 
-def _gateway_prompts(now: int) -> list:
+def _gateway_prompts(now: int, ctx: str = "") -> list:
     """Đề bài cho các lần mua compute qua gateway. KHÔNG có pool mặc định dùng chung: biên
     nhận on-chain mang prompt_hash, nên các fork gửi cùng đề = trùng hash công khai (tín hiệu
     sybil). Nguồn: FLOP_GATEWAY_PROMPTS ('a|b|c') của operator, không có thì phần thân các câu
@@ -4162,6 +4263,11 @@ def _gateway_prompts(now: int) -> list:
     if not raw:
         raw = [q["body"] for q in KIBBLE_REQ_QUESTIONS if q.get("body")]
     stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(now))
+    if ctx:
+        # Số liệu thị trường LIVE do chính agent dựng (trusted) -> mỗi đề là một câu hỏi khác thật
+        # sự, gắn với tình hình lúc đó, thay vì 120 câu cố định lặp lại khi faucet lớn.
+        return [f"{p}\n\nLive market context ({stamp}): {ctx}\n"
+                "(Use the figures where relevant; answer concretely.)" for p in raw[:200]]
     return [f"{p}\n\n(Answer concretely; as of {stamp}.)" for p in raw[:200]]
 
 
@@ -4186,14 +4292,26 @@ def gateway_session_step(state: dict, private_key, now: int):
     # Đề ưu tiên = job kibble THẬT agent vừa làm (mỗi đề một việc khác nhau, có người đặt);
     # hết job mới dùng đề của operator. Nội dung job là UNTRUSTED -> isolate như mọi chỗ khác.
     jobs = [j for j in (state.get("gateway_jobs") or []) if isinstance(j, dict) and j.get("task")]
+    # Đề dự phòng của operator chỉ cần khi hàng job không đủ cho một lượt -> chỉ lúc đó mới tốn
+    # một lần lấy số liệu thị trường live.
+    ctx = ""
+    if len(jobs) < int(_env_float("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)):
+        try:
+            ctx = build_market_context()
+        except Exception:
+            ctx = ""
+    op = _gateway_prompts(now, ctx)
+    op_idx = int(state.get("gateway_op_idx") or 0) % max(1, len(op))
     if jobs:
+        # Job trước, rồi đề operator (xoay vòng) -> hàng còn 1 job mà gọi 2 lần thì lần hai
+        # dùng đề KHÁC, không gửi lại cùng job.
         prompts = [isolate_for_llm(j["task"]) + "\n\nComplete the task above concretely and accurately."
-                   for j in jobs]
+                   for j in jobs] + op[op_idx:] + op[:op_idx]
         g0 = state.get(flop_gateway.KEY)
         if isinstance(g0, dict):
-            g0["prompt_idx"] = 0                      # dùng job theo thứ tự hàng đợi
+            g0["prompt_idx"] = 0                      # thứ tự do danh sách trên quyết định
     else:
-        prompts = _gateway_prompts(now)
+        prompts = op
     if not prompts:
         print("[gateway] chưa có đề bài (job kibble / FLOP_GATEWAY_PROMPTS / "
               "FLOP_KIBBLE_REQUEST_QUESTIONS) — không dùng đề mặc định chung với fork")
@@ -4206,10 +4324,19 @@ def gateway_session_step(state: dict, private_key, now: int):
         state, agent_key=private_key, now=now, prompts=prompts, expect_network=expect,
         http=_gateway_http,
         book_fn=book if testnet else None)
+    if testnet and r.get("receipts_new"):
+        # Lưu sổ cái NGAY: biên nhận vừa ghi đã được đánh dấu "đã ghi" trong state.json (cache lưu
+        # cả khi run lỗi). Nếu chỉ đợi persist cuối run mà run chết giữa chừng thì số chi mất
+        # VĨNH VIỄN (lượt sau coi biên nhận đã ghi rồi). persist ghi KV + bản sao state.json.
+        persist_ledger_to_kv(private_key, did_of(private_key))
     if jobs and r.get("calls"):
-        state["gateway_jobs"] = jobs[int(r["calls"]):]   # job đã dùng làm đề -> ra khỏi hàng
+        used = int(r["calls"])
+        state["gateway_jobs"] = jobs[used:]              # job đã dùng làm đề -> ra khỏi hàng
+        if used > len(jobs) and op:                      # phần còn lại dùng đề operator
+            state["gateway_op_idx"] = (op_idx + used - len(jobs)) % len(op)
     save_state({flop_gateway.KEY: state.get(flop_gateway.KEY),
-                "gateway_jobs": state.get("gateway_jobs", [])})
+                "gateway_jobs": state.get("gateway_jobs", []),
+                "gateway_op_idx": state.get("gateway_op_idx", 0)})
     oc = r.get("outcome")
     tag = "" if testnet else " (devnet tập, không ghi sổ)"
     status = f"{r.get('calls', 0)}✓ gateway/{oc}"
@@ -4351,7 +4478,10 @@ def main():
     tele_status = "skip"
     if force or _due(state, "last_telemetry", TELEMETRY_INTERVAL_H, now,
                      phase_s=_did_cadence_offset(did)):
-        if broadcast_telemetry(private_key, did):
+        if room_capped(ROOM):
+            tele_status = "cap"
+            print(f"[telemetry] r/{ROOM} đã hết hạn mức hôm nay — chờ sang ngày UTC mới (không phải lỗi)")
+        elif broadcast_telemetry(private_key, did):
             save_state({"last_telemetry": now})
             tele_status = "ok"
         else:
@@ -4365,7 +4495,10 @@ def main():
     #     Cùng nguyên tắc: chỉ đóng cổng khi post thành công.
     manifest_status = "skip"
     if _due(state, "last_manifest", MANIFEST_INTERVAL_H, now):
-        if broadcast_manifest(private_key, did):
+        if room_capped(MANIFEST_ROOM):
+            manifest_status = "cap"
+            print(f"[manifest] r/{MANIFEST_ROOM} đã hết hạn mức hôm nay — chờ sang ngày UTC mới (không phải lỗi)")
+        elif broadcast_manifest(private_key, did):
             save_state({"last_manifest": now})
             manifest_status = "ok"
         else:
@@ -4392,7 +4525,9 @@ def main():
     digest_status = "off"
     if DIGEST_ENABLED:
         if _due(state, "last_digest", DIGEST_INTERVAL_H, now):
-            if broadcast_digest(private_key, did):
+            if room_capped(ROOM):
+                digest_status = "cap"           # kiểm TRƯỚC: digest tốn 1 lần suy luận LLM
+            elif broadcast_digest(private_key, did):
                 save_state({"last_digest": now})
                 digest_status = "ok"
             else:
@@ -4416,6 +4551,8 @@ def main():
                 status_feed_status = "skip-outage"
                 print("[status-feed] bỏ qua — đường ghi technocore.chat đang lỗi "
                       f"(post ok={_post_ok_count} fail={_post_fail_count}); không cố post.")
+            elif not STATUS_FEED_DRY_RUN and room_capped(STATUS_FEED_ROOM):
+                status_feed_status = "cap"
             elif broadcast_status_feed(private_key, did, state):
                 save_state({"last_status_feed": now})
                 status_feed_status = "dry" if STATUS_FEED_DRY_RUN else "ok"
@@ -4438,7 +4575,9 @@ def main():
             state["last_recap"] = now
             recap_status = "seed"
         elif _due(state, "last_recap", RECAP_INTERVAL_H, now):
-            if broadcast_recap(private_key, did, state, now):
+            if room_capped(ROOM):
+                recap_status = "cap"
+            elif broadcast_recap(private_key, did, state, now):
                 save_state({"last_recap": now})
                 recap_status = "ok"
             else:
@@ -4689,7 +4828,13 @@ def main():
     session_status = "off"
     _wd_settled, _wd_last = 0, {}              # cho bộ canh chi thật (testnet) bên dưới
     _sess_on = os.environ.get("FLOP_SESSION_ENABLED", "").strip().lower() in ("1", "true", "on", "yes")
-    if _sess_on and os.environ.get("FLOP_SESSION_BACKEND", "").strip().lower() == "gateway":
+    _backend = os.environ.get("FLOP_SESSION_BACKEND", "").strip().lower()
+    if not _backend:
+        import token_manager as _tmb
+        # Testnet bật mà chưa chọn: dùng gateway — đường FLOP CÔNG BỐ. Scaffold mempool cũ không
+        # có endpoint thật nên quên đặt biến = cả ngày không chi gì. Đặt "mempool" để ép đường cũ.
+        _backend = "gateway" if _tmb.testnet_enabled() else "mempool"
+    if _sess_on and _backend == "gateway":
         # Đường THẬT FLOP công bố: mua compute qua gateway api.flop.network (flop_gateway).
         try:
             session_status, _wd_settled, _wd_last = gateway_session_step(state, private_key, now)

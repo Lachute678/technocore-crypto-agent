@@ -2994,6 +2994,7 @@ def test_mempool_adapter_raises_on_error_body(monkeypatch):
 def test_main_testnet_stops_new_sessions_at_pending_cap(monkeypatch, tmp_path):
     import flop_session
     import time as _t
+    monkeypatch.setenv("FLOP_SESSION_BACKEND", "mempool")   # testnet mặc định = gateway; test đường cũ
     monkeypatch.setattr(ac, "SEED_HEX", SEED_HEX)
     monkeypatch.setattr(ac, "RUNNER_ROLE", "primary")
     now = int(_t.time())
@@ -3557,3 +3558,206 @@ def test_faucet_manual_tier_never_claims_and_quick_warns_once(monkeypatch):
     ac.faucet_step(state, None, None)
     ac.faucet_step(state, None, None)
     assert len(sent) == 1 and "FLOP_FAUCET_TIER=manual" in sent[0]
+
+
+def test_last_queued_job_is_followed_by_an_operator_prompt(monkeypatch):
+    import flop_gateway
+    seen = {}
+    monkeypatch.setattr(flop_gateway, "run_step", lambda st, **k: seen.update(k) or
+                        {"outcome": "spent", "calls": 2, "spent": 1, "due": 1, "remaining": 5})
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "OpA|OpB")
+    state = {"gateway_jobs": [{"id": "k1", "task": "Only job"}]}
+    ac.gateway_session_step(state, _real_key(), 1_800_000_000)
+    p = seen["prompts"]
+    assert "Only job" in p[0] and p[1].startswith("OpA") and len(set(p)) == len(p)
+    assert state["gateway_jobs"] == [] and state["gateway_op_idx"] == 1   # lần sau bắt đầu từ OpB
+
+
+def test_capped_room_skips_periodic_posts_without_failing(monkeypatch):
+    # Hai fork đo được 2026-10-24: lobby 20/20 -> telemetry/manifest/status-feed báo "fail" và
+    # thử lại MỖI lượt. Hết hạn mức không phải lỗi: bỏ qua tới ngày mới, không dựng nội dung.
+    import flop_governor
+    monkeypatch.setattr(ac, "POST_GOVERNOR", True)
+    now = 1_800_000_000
+    ac._post_gov_state.clear()
+    ac._post_gov_state[flop_governor.KEY] = {"day": flop_governor._today(now),
+                                             "rooms": {ac.ROOM: 10_000}, "alerted": []}
+    monkeypatch.setattr(ac.time, "time", lambda: now)
+    assert ac.room_capped(ac.ROOM) is True
+    assert ac.room_capped("some-quiet-room") is False
+    monkeypatch.setattr(ac, "POST_GOVERNOR", False)
+    assert ac.room_capped(ac.ROOM) is False
+
+
+def test_faucet_cooldown_written_in_text_is_a_wait_not_an_error(monkeypatch):
+    # Devnet 2026-10-24: "địa chỉ này vừa được cấp vốn; thử lại sau 1306 phút". Trước đây 4xx
+    # như vậy -> error_claim -> gõ lại mỗi giờ (~22 lần bị từ chối/ngày).
+    monkeypatch.setenv("FLOP_FAUCET_ADDRESS", FLOP_ADDR)
+    monkeypatch.delenv("FLOP_FAUCET_TIER", raising=False)
+
+    class R:
+        status_code, headers, content = 400, {}, b"{...}"
+        def json(self):
+            return {"success": False, "error": "This address was just funded; try again in 1306 minutes"}
+        def raise_for_status(self):
+            raise AssertionError("không được coi là lỗi")
+    monkeypatch.setattr(ac.requests, "post", lambda *a, **k: R())
+    out = ac._faucet_claim_fn({"faucet_url": "https://faucet.flop.network/fund"})
+    assert out == {"amount": 0, "retry_after_s": 1306 * 60}
+    assert ac._wait_from_text("Địa chỉ này vừa được cấp vốn; thử lại sau 1306 phút") == 1306 * 60
+    assert ac._wait_from_text("cooldown active") is None
+
+
+def test_success_text_with_a_duration_is_not_read_as_a_wait(monkeypatch):
+    monkeypatch.setenv("FLOP_FAUCET_ADDRESS", FLOP_ADDR)
+    monkeypatch.setattr(ac.requests, "post", lambda *a, **k: _resp_with_body(
+        {"success": True, "amount": 25, "message": "Funded in 2 seconds", "txHash": "0x" + "ab" * 32}))
+    monkeypatch.setattr(ac, "_faucet_cooldown_s", lambda url, linked: 86460)
+    out = ac._faucet_claim_fn({"faucet_url": "https://faucet.flop.network/fund"})
+    assert out["amount"] == 25 and out["retry_after_s"] == 86460          # chu kỳ /health, không phải 2s
+
+
+def test_gateway_refs_travel_with_the_kv_ledger(tmp_path, monkeypatch):
+    import token_manager as tm
+    p = str(tmp_path / "led.json")
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", p)
+    tm.save_ledger({"balances": {"FLOP": "1"}, "entries": [], "gateway_refs": ["a" * 16, "b" * 16]})
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, k, v: sent.update({k: v}) or True)
+    ac.persist_ledger_to_kv("pk", "did")
+    assert json.loads(sent["token_ledger"])["gateway_refs"] == ["a" * 16, "b" * 16]
+
+
+def test_testnet_without_a_backend_choice_uses_the_gateway(monkeypatch, tmp_path):
+    # Quên đặt FLOP_SESSION_BACKEND ngày testnet -> trước đây rơi về scaffold mempool (không có
+    # endpoint thật) = cả ngày không chi gì.
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "led.json"))
+    monkeypatch.setenv("FLOP_PACER_FILE", str(tmp_path / "pacer.json"))
+    monkeypatch.setattr(ac, "SEED_HEX", SEED_HEX)
+    monkeypatch.setattr(ac, "RUNNER_ROLE", "primary")
+    for name in ("hydrate_durable_from_kv", "hydrate_ledger_from_kv", "write_heartbeat",
+                 "persist_durable_to_kv", "persist_ledger_to_kv", "_write_summary", "check_price_alert"):
+        monkeypatch.setattr(ac, name, lambda *a, **k: None)
+    monkeypatch.setattr(ac, "load_state", lambda: {})
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setattr(ac, "broadcast_telemetry", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "broadcast_manifest", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "auto_respond", lambda *a, **k: (0, 0))
+    monkeypatch.setattr(ac, "_telegram_send", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "_server_ok_count", 1)
+    monkeypatch.setenv("FLOP_SESSION_ENABLED", "on")
+    monkeypatch.delenv("FLOP_SESSION_BACKEND", raising=False)
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    hit = []
+    monkeypatch.setattr(ac, "gateway_session_step", lambda *a, **k: hit.append(1) or ("0✓ gateway/x", 0, {}))
+    ac.main()
+    assert hit == [1]
+
+
+def test_faucet_defaults_to_the_gateway_wallet_and_appends_fund(monkeypatch):
+    # Ngày testnet: FLOP_FAUCET_ADDRESS trống -> faucet phải nạp đúng ví mua compute (DID),
+    # và URL chỉ có tên miền -> tự thêm /fund.
+    monkeypatch.delenv("FLOP_FAUCET_ADDRESS", raising=False)
+    monkeypatch.delenv("FLOP_FAUCET_TIER", raising=False)
+    monkeypatch.setattr(ac, "_faucet_default_addr", FLOP_ADDR)
+    sent = {}
+    monkeypatch.setattr(ac.requests, "post", lambda url, json=None, **k: sent.update(url=url, body=json)
+                        or _resp_with_body({"success": True, "amount": 25, "txHash": "0x" + "ab" * 32}))
+    monkeypatch.setattr(ac, "_faucet_cooldown_s", lambda url, linked: 86460)
+    ac._faucet_claim_fn({"faucet_url": "https://faucet.flop.network", "signed": {"old": 1}})
+    assert sent["url"] == "https://faucet.flop.network/fund" and sent["body"] == {"address": FLOP_ADDR}
+    monkeypatch.setattr(ac, "_faucet_default_addr", None)
+    assert ac._faucet_body({"signed": {"old": 1}}) == ({"old": 1}, False)   # không ví -> như cũ
+
+
+def test_faucet_step_warns_once_when_faucet_and_wallet_differ(monkeypatch, tmp_path):
+    import flop_faucet
+    monkeypatch.setenv("FLOP_FAUCET_STATE", str(tmp_path / "f.json"))
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "l.json"))
+    monkeypatch.setenv("FLOP_FAUCET_ENABLED", "on")
+    monkeypatch.setenv("FLOP_FAUCET_TIER", "linked")
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.setenv("FLOP_WALLET_USE_DID", "on")
+    monkeypatch.setenv("FLOP_FAUCET_ADDRESS", "5DZsAQuavUAM7A6XvoTkDQgtQdRCMcALdUd6Bx4FSoFMF8ux")
+    sent = []
+    monkeypatch.setattr(ac, "_telegram_send", lambda t: sent.append(t) or True)
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setattr(flop_faucet, "run_faucet_cycle", lambda **k: {"outcome": "skipped_cooldown"})
+    monkeypatch.setattr(flop_faucet, "seconds_until_next", lambda **k: None)
+    state = {}
+    ac.faucet_step(state, _real_key(), "did")
+    ac.faucet_step(state, _real_key(), "did")
+    assert len([m for m in sent if "ví mua compute" in m]) == 1
+
+
+def test_new_settled_receipts_persist_the_ledger_immediately(monkeypatch):
+    # Biên nhận mới ghi sổ -> lưu sổ cái NGAY, không đợi cuối run (run chết giữa chừng = mất số chi).
+    import flop_gateway
+    persisted = []
+    monkeypatch.setattr(ac, "persist_ledger_to_kv", lambda pk, did: persisted.append(did))
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "q")
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.setattr(flop_gateway, "run_step", lambda st, **k: {"outcome": "pace_wait", "calls": 0,
+                                                                   "receipts_new": 2, "settled_new": 13.0})
+    ac.gateway_session_step({}, _real_key(), 1_800_000_000)
+    assert persisted == [ac.did_of(_real_key())]
+    persisted.clear()
+    monkeypatch.setattr(flop_gateway, "run_step", lambda st, **k: {"outcome": "pace_wait", "calls": 0,
+                                                                   "receipts_new": 0})
+    ac.gateway_session_step({}, _real_key(), 1_800_000_000)
+    assert persisted == []                                              # không có gì mới -> không ghi KV thừa
+
+
+def test_faucet_claim_persists_the_ledger_immediately(monkeypatch, tmp_path):
+    import flop_faucet
+    monkeypatch.setenv("FLOP_FAUCET_STATE", str(tmp_path / "f.json"))
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "l.json"))
+    monkeypatch.setenv("FLOP_FAUCET_ENABLED", "on")
+    monkeypatch.setenv("FLOP_FAUCET_TIER", "linked")
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.delenv("FLOP_FAUCET_ADDRESS", raising=False)
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    persisted = []
+    monkeypatch.setattr(ac, "persist_ledger_to_kv", lambda pk, did: persisted.append(did))
+    monkeypatch.setattr(flop_faucet, "run_faucet_cycle", lambda **k: {"outcome": "claimed", "amount": "500"})
+    assert ac.faucet_step({}, _real_key(), "did:x") == "claimed" and persisted == ["did:x"]
+    persisted.clear()
+    monkeypatch.setattr(flop_faucet, "run_faucet_cycle", lambda **k: {"outcome": "skipped_cooldown"})
+    monkeypatch.setattr(flop_faucet, "seconds_until_next", lambda **k: None)
+    ac.faucet_step({}, _real_key(), "did:x")
+    assert persisted == []
+
+
+def test_operator_fallback_prompts_carry_live_market_context(monkeypatch):
+    # Faucet lớn -> đề dự phòng (120 câu) dùng nhiều: gắn số liệu live để mỗi đề là câu khác thật sự.
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "Explain oracle failure modes|Compare TWAP vs spot")
+    p = ac._gateway_prompts(1_800_000_000, "BTC $84000 (-2.1%) · Fear&Greed 40(Fear)")
+    assert "Live market context (2027-01-15T08:00Z): BTC $84000" in p[0] and p[1].startswith("Compare TWAP")
+    assert "Live market context" not in ac._gateway_prompts(1_800_000_000)[0]      # không có số liệu -> như cũ
+    import flop_gateway
+    seen, calls = {}, []
+    monkeypatch.setattr(ac, "build_market_context", lambda *a, **k: calls.append(1) or "BTC $1")
+    monkeypatch.setattr(flop_gateway, "run_step", lambda st, **k: seen.update(k) or {"outcome": "pace_wait", "calls": 0})
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    ac.gateway_session_step({}, _real_key(), 1_800_000_000)
+    assert calls == [1] and "BTC $1" in seen["prompts"][0]
+    calls.clear()
+    ac.gateway_session_step({"gateway_jobs": [{"id": "a", "task": "t1"}, {"id": "b", "task": "t2"}]},
+                            _real_key(), 1_800_000_000)
+    assert calls == []                                       # đủ job cho cả lượt -> không tốn lần lấy giá
+
+
+def test_faucet_waits_are_clamped_and_never_raise():
+    # Fuzz 2026-10-26: số khổng lồ -> OverflowError; "sau 999999 phút" -> hẹn ~2 năm = tắt faucet.
+    assert ac._faucet_retry_after(None, {"retry_after": "9" * 400}) in (None, ac.FAUCET_WAIT_MAX)
+    assert ac._faucet_retry_after(None, {"error": "try again in 999999 minutes"}, True) == ac.FAUCET_WAIT_MAX
+    assert ac._faucet_retry_after("3600", {}) == 3600                     # giá trị bình thường giữ nguyên
+    assert ac.scrub_links_and_addresses(None) is None
+
+
+def test_gateway_parsers_survive_hostile_values():
+    import flop_gateway as gw
+    assert gw.epoch_s("9" * 400) is None and gw.epoch_s(float("inf")) is None and gw.epoch_s(10**20) is None
+    assert gw.network_matches(-1, "testnet") is False and gw.network_matches(1.5, "testnet") is False

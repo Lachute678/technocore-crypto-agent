@@ -148,7 +148,8 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
    (`faucet=skipped_simulation`) so a real claim is never booked into the mock ledger.
 2. `FLOP_SESSION_MODEL_HASH` from the published model catalog; delete
    `FLOP_SESSION_SIM_MODEL_HASH`.
-3. **Gateway backend (the path FLOP published):** `FLOP_SESSION_BACKEND=gateway` and
+3. **Gateway backend (the path FLOP published):** `FLOP_SESSION_BACKEND=gateway` (the default
+   once `TESTNET_ENABLED` is on; set `mempool` only to force the old scaffold) and
    **`FLOP_WALLET_USE_DID=on` - the DID key is the FLOP wallet** (SS58
    `5CFP215CEbCtDduwG1Nzu5rmYXKfHc47wSATUi1oRvrkQnUP` for the current DID). Decided
    2026-10-24: tclk's FLOP HTLC rail (`@flop-labs/tclk-flop`, tclk #210) binds each party's
@@ -165,7 +166,7 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
    booked). The scaffold mempool path stays for reference: `FLOP_MEMPOOL_URL`,
    `FLOP_RPC_URL`/`FLOP_SUBMIT_URL` (+ `FLOP_TX_MODE`).
 4. `FLOP_FAUCET_ENABLED=on`, `FLOP_FAUCET_URL` (devnet shape:
-   `https://faucet.flop.network/fund`), `FLOP_FAUCET_ADDRESS=<SS58 of the DID wallet, item 3>`.
+   `https://faucet.flop.network/fund`; a bare domain gets `/fund` appended). `FLOP_FAUCET_ADDRESS` can stay empty: the faucet then funds the gateway wallet (the DID, item 3) - the account that buys the compute; a different address triggers a one-time warning.
    With an address set the adapter sends the real body and reads the 24 h cooldown from
    the faucet's `/health`, so `auto` waits a full day instead of probing hourly.
    **Verified-human tier (operator only):** prove personhood once on the faucet page with
