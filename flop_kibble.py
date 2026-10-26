@@ -250,6 +250,7 @@ def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
       - verb JOB, type nằm trong allow_types,
       - jobid CHƯA có trong done_set (chưa từng deliver),
       - KHÔNG phải job do CHÍNH mình đăng (nếu biết my_did),
+      - CHƯA có DELIVER của worker KHÁC trong `messages`,
     ưu tiên MỚI nhất (seq lớn), tối đa max_n. Trả list dict job (có thêm 'seq').
     Hàm THUẦN — không mạng, không side-effect. allow_types RỖNG -> trả [] (whitelist rỗng
     = không nhận gì), KHÔNG phải "nhận mọi type".
@@ -258,6 +259,15 @@ def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
     if not allow:
         return []       # whitelist RỖNG = KHÔNG nhận gì (an toàn) — không phải "nhận tất cả"
     done = set(done_set or [])
+    # Job đã có người khác giao: giao thêm chỉ là bài trễ (đo 2026-10-26: 16/30 lần) — tốn LLM
+    # và trông như bám đuôi bài người khác.
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        parsed = parse_kibble_msg(m.get("text", ""))
+        sender = m.get("from") or m.get("did")
+        if parsed and parsed["verb"] == "DELIVER" and not (my_did and sender == my_did):
+            done.add(parsed["jobid"])
     jobs = {}       # jobid -> job dict (giữ bản có seq lớn nhất)
     for m in (messages or []):
         if not isinstance(m, dict):

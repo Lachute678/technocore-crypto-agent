@@ -89,6 +89,21 @@ def test_select_skips_own_did_and_orders_and_caps():
     assert [j["jobid"] for j in jobs] == ["k000000000c"]   # bỏ của mình, mới nhất trước, cap 1
 
 
+def test_select_skips_jobs_another_worker_already_delivered():
+    # 2026-10-26: 16/30 bài giao là cho job người khác đã giao trước -> bài trễ, phí LLM.
+    msgs = [
+        _msg(40, "JOB v1 | k0000000010 | explain | taken | x"),
+        _msg(41, "JOB v1 | k0000000011 | explain | free | x"),
+        _msg(42, "JOB v1 | k0000000012 | explain | mine-delivered-earlier | x"),
+        _msg(43, "CLAIM v1 | k0000000011 | worker", frm="did:key:zOther"),     # chỉ CLAIM -> vẫn chọn
+        _msg(44, "DELIVER v1 | k0000000010 | done already", frm="did:key:zOther"),
+        _msg(45, "DELIVER v1 | k0000000012 | my old answer", frm="did:key:zME"),
+    ]
+    jobs = k.select_jobs(msgs, done_set=set(), allow_types=["explain"], max_n=5,
+                         my_did="did:key:zME")
+    assert [j["jobid"] for j in jobs] == ["k0000000012", "k0000000011"]
+
+
 # --- run_kibble_worker (orchestrator, fake deps) ----------------------------------
 
 def _fetch(messages, last_seq):
