@@ -134,11 +134,16 @@ def parse_kibble_msg(text: str):
 DUP_KEEP = 40                     # số vân tay giữ lại (trần chống phình state)
 DUP_TTL_MS = 6 * 3600 * 1000      # vân tay HẾT HẠN sau 6h -> chống loạt, không cấm vĩnh viễn
 _WORD_RE = re.compile(r"[a-z0-9]+")
+# Hậu tố mã job cuối tiêu đề, vd "(mvp0uydl-3)": mỗi job một mã khác nên với job NGẮN (~12 từ)
+# riêng nó đủ kéo Jaccard xuống ~0.846 < 0.85 -> cả loạt "Copper vs aluminum" lọt lọc trùng.
+# Chỉ bỏ nhóm ngoặc CUỐI có chữ số; thuật ngữ như ed25519/secp256k1 vẫn giữ.
+_ID_SUFFIX_RE = re.compile(r"\s*\([^()]*\d[^()]*\)\s*$")
 
 
 def job_fingerprint(title: str, body: str) -> list:
-    """Vân tay 1 job = tập TỪ chuẩn hoá (sorted, không trùng) của title+body."""
-    return sorted(set(_WORD_RE.findall(f"{title or ''} {body or ''}".lower())))
+    """Vân tay 1 job = tập TỪ chuẩn hoá (sorted, không trùng) của title+body, bỏ hậu tố mã job."""
+    title = _ID_SUFFIX_RE.sub("", title or "")
+    return sorted(set(_WORD_RE.findall(f"{title} {body or ''}".lower())))
 
 
 def similarity(a, b) -> float:

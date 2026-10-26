@@ -269,6 +269,19 @@ def test_template_family_is_near_duplicate_but_distinct_jobs_are_not():
     assert k.is_near_duplicate(c, recent, 0.85, now_ms=1_000) is False
 
 
+def test_short_template_jobs_differing_only_by_id_suffix_are_duplicates():
+    # ~12 từ + 1 mã job khác nhau -> Jaccard 0.846 < 0.85: cả loạt "Copper vs aluminum" từng
+    # được trả lời 3 lần trong 1 giờ. Mã cuối tiêu đề không được tính vào vân tay.
+    body = "Which has the higher electrical conductivity: copper or aluminum?"
+    a = k.job_fingerprint("Copper vs aluminum (mvp0uydl-3)", body)
+    b = k.job_fingerprint("Copper vs aluminum (mvp0w2w8-3)", body)
+    assert a == b and "mvp0uydl" not in a
+    assert k.is_near_duplicate(b, k.remember_fingerprint([], a, now_ms=1), 0.85, now_ms=1)
+    assert "ed25519" in k.job_fingerprint("Ed25519 vs secp256k1 (x1)", "speed")
+    assert "secp256k1" in k.job_fingerprint("Ed25519 vs secp256k1 (x1)", "speed")
+    assert k.job_fingerprint("Gas (fees)", "x") == ["fees", "gas", "x"]   # ngoặc không có số -> giữ
+
+
 def test_is_near_duplicate_disabled_at_zero_threshold():
     a = k.job_fingerprint("same", "same body")
     assert k.is_near_duplicate(a, [a], 0.0) is False     # 0 = tắt hẳn
