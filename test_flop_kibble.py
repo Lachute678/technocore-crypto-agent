@@ -106,10 +106,33 @@ def test_select_skips_jobs_another_worker_already_delivered():
     assert [j["jobid"] for j in jobs] == ["k0000000012", "k0000000011"]
 
 
+def test_select_skips_jobs_posted_by_fleet_dids():
+    # Làm job do agent cùng nhà đăng = tự mua-bán (sybil). tclk/session đã lọc fleet, kibble thì chưa.
+    msgs = [
+        _msg(50, "JOB v1 | k0000000020 | explain | fleet job | x", frm="did:key:zFleet"),
+        _msg(51, "JOB v1 | k0000000021 | explain | stranger job | x"),
+    ]
+    jobs = k.select_jobs(msgs, done_set=set(), allow_types=["explain"], max_n=5,
+                         deny_dids={"did:key:zFleet"})
+    assert [j["jobid"] for j in jobs] == ["k0000000021"]
+    assert len(k.select_jobs(msgs, set(), ["explain"], 5)) == 2          # không có deny -> như cũ
+
+
 # --- run_kibble_worker (orchestrator, fake deps) ----------------------------------
 
 def _fetch(messages, last_seq):
     return lambda since: {"messages": messages, "last_seq": last_seq}
+
+
+def test_run_worker_never_answers_a_fleet_job():
+    msgs = [_msg(60, "JOB v1 | k0000000030 | explain | T | body", frm="did:key:zFleet")]
+    answered = []
+    out = k.run_kibble_worker(
+        fetch_fn=_fetch(msgs, 60), answer_fn=lambda job: answered.append(job) or "x",
+        post_fn=lambda text: True, state={}, allow_types=["explain"], dry_run=False,
+        log=lambda *_: None, deny_dids={"did:key:zFleet"},
+    )
+    assert answered == [] and out["delivered"] == []
 
 
 def test_run_dry_run_posts_nothing_but_advances_cursor():

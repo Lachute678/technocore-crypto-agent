@@ -248,11 +248,13 @@ _DELIVERED_RE = re.compile(r"^(?:DELIVER|RESULT) v1 \| (\S+) \|")
 
 
 def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
-                recent_fps=None, dup_sim=0.0, now_ms: int = 0, ttl_ms: int = DUP_TTL_MS):
+                recent_fps=None, dup_sim=0.0, now_ms: int = 0, ttl_ms: int = DUP_TTL_MS,
+                deny_dids=None):
     """Từ danh sách message (mỗi cái {seq, from/did, text}) chọn ra các JOB nên làm:
       - verb JOB, type nằm trong allow_types,
       - jobid CHƯA có trong done_set (chưa từng deliver),
-      - KHÔNG phải job do CHÍNH mình đăng (nếu biết my_did),
+      - KHÔNG phải job do CHÍNH mình hay fleet nhà (deny_dids) đăng — làm job của agent
+        cùng nhà là tự mua-bán, đúng tín hiệu sybil,
       - CHƯA có DELIVER của worker KHÁC trong `messages`,
     ưu tiên MỚI nhất (seq lớn), tối đa max_n. Trả list dict job (có thêm 'seq').
     Hàm THUẦN — không mạng, không side-effect. allow_types RỖNG -> trả [] (whitelist rỗng
@@ -262,6 +264,7 @@ def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
     if not allow:
         return []       # whitelist RỖNG = KHÔNG nhận gì (an toàn) — không phải "nhận tất cả"
     done = set(done_set or [])
+    deny = set(deny_dids or [])
     # Job đã có người khác giao: giao thêm chỉ là bài trễ (đo 2026-10-26: 16/30 lần) — tốn LLM
     # và trông như bám đuôi bài người khác. Phần lớn worker giao bằng RESULT (kibble-v1:
     # JOB→CLAIM→RESULT→ATTEST), số ít còn dùng DELIVER -> tính cả hai.
@@ -285,7 +288,7 @@ def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
         if parsed["type"] not in allow:
             continue
         sender = m.get("from") or m.get("did")
-        if my_did and sender == my_did:
+        if (my_did and sender == my_did) or sender in deny:
             continue
         seq = m.get("seq", 0) or 0
         parsed = {**parsed, "seq": seq}
@@ -323,7 +326,7 @@ def run_kibble_worker(fetch_fn, answer_fn, post_fn, state, *,
                       allow_types=None, max_per_run=2, do_claim=True,
                       dry_run=True, log=print,
                       recent_fps=None, dup_sim=0.0, now_ms: int = 0,
-                      ttl_ms: int = DUP_TTL_MS):
+                      ttl_ms: int = DUP_TTL_MS, deny_dids=None):
     """Chạy MỘT vòng worker. Phụ thuộc được TIÊM vào để test không cần mạng/LLM:
       fetch_fn(since)   -> dict {"messages":[...], "last_seq":int} (như API technocore)
       answer_fn(job)    -> str | None  (None = bỏ job, KHÔNG đăng rác)
@@ -346,7 +349,7 @@ def run_kibble_worker(fetch_fn, answer_fn, post_fn, state, *,
     jobs = select_jobs(messages, done_set, allow_types, max_per_run,
                        my_did=state.get("kibble_did"),
                        recent_fps=recent_fps, dup_sim=dup_sim,
-                       now_ms=now_ms, ttl_ms=ttl_ms)
+                       now_ms=now_ms, ttl_ms=ttl_ms, deny_dids=deny_dids)
 
     delivered, committed, skipped = [], [], 0
     delivered_items = []          # {jobid, answer} cho các DELIVER THẬT (dùng cho tracker ATTEST)

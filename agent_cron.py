@@ -4651,6 +4651,7 @@ def main():
                 # Lọc gần-trùng NGAY LÚC CHỌN -> đợt job toàn một họ không đốt hết quota.
                 recent_fps=_kibble_recent_fps, dup_sim=KIBBLE_DUP_SIM,
                 now_ms=int(time.time() * 1000), ttl_ms=_kibble_dup_ttl_ms(),
+                deny_dids=PROACTIVE_DENY_DIDS,   # KHÔNG làm job do fleet nhà đăng -> chống tự-mua-bán (sybil)
             )
             queue_gateway_jobs(state)
             save_state({"kibble_cursor": state.get("kibble_cursor"),
