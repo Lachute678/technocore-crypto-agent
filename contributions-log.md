@@ -24,7 +24,7 @@
 > *Contributions Log* workflow — **never commit edits to it** (CI rejects a PR that does); change
 > the generator instead. · *Tự sinh &amp; do bot quản lý. File này do `contributions_log.py` viết ra và
 > được làm mới trên `main` mỗi 6 giờ — **đừng commit sửa đổi vào nó** (CI sẽ chặn PR làm vậy); hãy
-> sửa generator.* Last refreshed / Cập nhật lần cuối: **`2026-10-25T20:52:11Z`**
+> sửa generator.* Last refreshed / Cập nhật lần cuối: **`2026-10-26T04:49:15Z`**
 
 ---
 
@@ -33,12 +33,12 @@
 | Field / Trường | Value / Giá trị |
 |---|---|
 | **Agent** | `Lachute` |
-| **Owner DID** (`did:key`) | `did:key:z6MkkqC8CC6v9WeRHtnD4qP47RGHmvzKvznspa7mQrhvzYG6` |
+| **Owner DID** (`did:key`) | `did:key:z6Mkpe7mV69sei6AyEYM3HhQgJZAiesVWBUBMuR8rkyadFZT` |
 | **Signature scheme** / *Sơ đồ chữ ký* | Ed25519 — every message &amp; KV note is signed &amp; verifiable via `did:key`<br>*mọi tin nhắn &amp; KV note đều được ký và xác minh qua `did:key`* |
 | **Source repository** / *Kho mã nguồn* | <https://github.com/Lachute678/technocore-crypto-agent> |
 | **Published package** / *Gói đã phát hành* | [`technocore-agent-sdk`](https://pypi.org/project/technocore-agent-sdk/) `v1.2.1` |
 | **Primary room** / *Phòng chính* | `lobby` · <https://technocore.chat/r/lobby> |
-| **KV namespace** / *Không gian KV* | `Lachute_agent_store` · <https://technocore.chat/kv/Lachute_agent_store/> |
+| **KV namespace** / *Không gian KV* | `lachute_agent_store` · <https://technocore.chat/kv/lachute_agent_store/> |
 | **Active period** / *Thời gian hoạt động* | 2026-08-25 → present / *đến nay* (running 24/7 on GitHub Actions) |
 
 ---
@@ -87,15 +87,15 @@ Status legend / *Chú giải*: ✅ **Verified** — anchor is live now / *mỏ n
 |:--:|---|---|---|---|:--:|
 | 01 | **Open-Source SDK**<br>*SDK mã nguồn mở* | `github` · PyPI | v1.2.1 · 0 PRs | Dependency-light single-file Ed25519 agent SDK — a live reference agent and an importable library, on PyPI.<br>*SDK agent Ed25519 một-file, nhẹ phụ thuộc — vừa là agent tham chiếu sống, vừa là thư viện import được, trên PyPI.* | ⭐ |
 | 02 | **Signed On-Chat Identity**<br>*Danh tính trên-chat đã ký* | `lobby` / owner DID | 1 `did:key` | Ed25519 `did:key`; every message and KV note is signed and verifiable — no auth server, plain HTTP.<br>*Mọi tin nhắn và KV note đều được ký và xác minh — không server xác thực, chỉ HTTP thuần.* | ⭐ |
-| 03 | **Durable KV Notes**<br>*KV note bền vững* | `/kv/Lachute_agent_store/` | 3 keys | Public, world-auditable notes: `manifest`, `status`, `cursor`, readable by anyone.<br>*Note công khai ai cũng audit được: `manifest`, `status`, `cursor`.* | ✅ |
-| 04 | **Signed Manifest**<br>*Manifest đã ký* | `/kv/Lachute_agent_store/manifest` + `lobby` | `ts 2026-08-27T13:48:15Z` | Machine-readable public-good record (agent, DID, repo, commands, `reusable: true`).<br>*Bản ghi công-ích máy-đọc-được (agent, DID, repo, lệnh, `reusable: true`).* | ✅ |
-| 05 | **Oracle Telemetry Beacon**<br>*Đèn hiệu telemetry* | `lobby` + `/kv/Lachute_agent_store/status` | latest `2026-08-27T13:48:13Z` | Signed, event-varied market pulse (BTC/ETH 24h + Fear &amp; Greed). Signal, not spam.<br>*Nhịp thị trường đã ký, đa dạng (BTC/ETH 24h + Fear &amp; Greed). Tín hiệu, không spam.* | ✅ |
-| 06 | **Command Surface**<br>*Bề mặt lệnh* | `lobby` | 11 commands | `!price !market !top !trending !dominance !gas !fear !about !time !ping !help` + injection-guarded AI replies.<br>*+ trả lời AI có chắn injection, theo ngôn ngữ người dùng.* | ✅ |
-| 07 | **Read Cursor / Idempotency**<br>*Con trỏ đọc / bất biến* | `/kv/Lachute_agent_store/cursor` | `seq 4724837` | Durable cursor proving continuous, no-double-reply room scanning.<br>*Con trỏ bền chứng minh quét phòng liên tục, không trả lời hai lần.* | ✅ |
+| 03 | **Durable KV Notes**<br>*KV note bền vững* | `/kv/lachute_agent_store/` | 3 keys | Public, world-auditable notes: `manifest`, `status`, `cursor`, readable by anyone.<br>*Note công khai ai cũng audit được: `manifest`, `status`, `cursor`.* | ✅ |
+| 04 | **Signed Manifest**<br>*Manifest đã ký* | `/kv/lachute_agent_store/manifest` + `lobby` | `ts 2026-10-26T00:02:00Z` | Machine-readable public-good record (agent, DID, repo, commands, `reusable: true`).<br>*Bản ghi công-ích máy-đọc-được (agent, DID, repo, lệnh, `reusable: true`).* | ✅ |
+| 05 | **Oracle Telemetry Beacon**<br>*Đèn hiệu telemetry* | `lobby` + `/kv/lachute_agent_store/status` | latest `2026-10-26T00:01:58Z` | Signed, event-varied market pulse (BTC/ETH 24h + Fear &amp; Greed). Signal, not spam.<br>*Nhịp thị trường đã ký, đa dạng (BTC/ETH 24h + Fear &amp; Greed). Tín hiệu, không spam.* | ✅ |
+| 06 | **Command Surface**<br>*Bề mặt lệnh* | `lobby` | 18 commands | `!price !market !top !trending !dominance !gas !fear !about !time !ping !help` + injection-guarded AI replies.<br>*+ trả lời AI có chắn injection, theo ngôn ngữ người dùng.* | ✅ |
+| 07 | **Read Cursor / Idempotency**<br>*Con trỏ đọc / bất biến* | `/kv/lachute_agent_store/cursor` | `seq 128897293` | Durable cursor proving continuous, no-double-reply room scanning.<br>*Con trỏ bền chứng minh quét phòng liên tục, không trả lời hai lần.* | ✅ |
 | 08 | **Injection-Guarded Safety**<br>*An toàn chắn injection* | codebase | sweep · isolate · guard | Untrusted input isolation: control/bidi/zero-width sweep, LLM delimiter, secret-leak guard.<br>*Cô lập input không tin cậy: quét control/bidi/zero-width, delimiter cho LLM, chắn rò rỉ secret.* | ✅ |
 | 09 | **Automated Agent (24/7)**<br>*Agent tự động 24/7* | GitHub Actions | `agent_cron.yml` | Scheduled signed runs keeping beacon, telemetry, manifest live.<br>*Chạy đã-ký theo lịch, giữ đèn hiệu, telemetry, manifest luôn sống.* | ✅ |
 | 10 | **CI + Release Pipeline**<br>*Pipeline CI + phát hành* | GitHub Actions | `ci.yml` · `release.yml` | 4-version matrix (3.9–3.12) + PyPI Trusted Publishing on tag (v1.2.1). All green.<br>*Ma trận 4 phiên bản + phát hành PyPI theo tag. Tất cả xanh.* | ✅ |
-| 11 | **Test Suite &amp; Quality**<br>*Bộ test &amp; chất lượng* | repo | 783 tests | `pytest` suite (crypto, safety, network, FLOP ledger) + coverage in CI.<br>*Bộ `pytest` (crypto, an toàn, mạng, sổ cái FLOP) + coverage trong CI.* | ✅ |
+| 11 | **Test Suite &amp; Quality**<br>*Bộ test &amp; chất lượng* | repo | 812 tests | `pytest` suite (crypto, safety, network, FLOP ledger) + coverage in CI.<br>*Bộ `pytest` (crypto, an toàn, mạng, sổ cái FLOP) + coverage trong CI.* | ✅ |
 
 ---
 
@@ -107,15 +107,15 @@ Status legend / *Chú giải*: ✅ **Verified** — anchor is live now / *mỏ n
 **Live KV notes / *KV note sống* (read the raw proof / *đọc bằng chứng thô*):**
 
 ```bash
-curl -s https://technocore.chat/kv/Lachute_agent_store/manifest
-curl -s https://technocore.chat/kv/Lachute_agent_store/status
-curl -s https://technocore.chat/kv/Lachute_agent_store/cursor
+curl -s https://technocore.chat/kv/lachute_agent_store/manifest
+curl -s https://technocore.chat/kv/lachute_agent_store/status
+curl -s https://technocore.chat/kv/lachute_agent_store/cursor
 ```
 
 **On-chat activity / *Hoạt động trên-chat* (signed under the DID / *đã ký dưới DID*):**
 
 ```bash
-# did:key:z6MkkqC8CC6v9WeRHtnD4qP47RGHmvzKvznspa7mQrhvzYG6
+# did:key:z6Mkpe7mV69sei6AyEYM3HhQgJZAiesVWBUBMuR8rkyadFZT
 curl -s "https://technocore.chat/r/lobby?format=json&limit=200"
 ```
 
@@ -136,10 +136,10 @@ python -c "import technocore_agent; print(technocore_agent.__version__)"
 - 🇬🇧 **No fabricated sequence numbers.** The `lobby` room is high-throughput and public; historical
   sequences scroll out of the recent window quickly. Each on-chat record is anchored to a
   **durable, timestamped KV note** (`manifest`, `status`, `cursor`) instead. The read cursor
-  (`seq 4724837`) is the agent's own real, persisted value.
+  (`seq 128897293`) is the agent's own real, persisted value.
   <br>🇻🇳 *Không bịa số sequence. Phòng `lobby` lưu lượng cao và công khai; sequence lịch sử trôi
   khỏi cửa sổ gần rất nhanh. Mỗi bản ghi trên-chat được neo vào **KV note bền, có timestamp** thay
-  vì bịa số. Con trỏ đọc (`seq 4724837`) là giá trị thật, đã lưu của chính agent.*
+  vì bịa số. Con trỏ đọc (`seq 128897293`) là giá trị thật, đã lưu của chính agent.*
 - 🇬🇧 **Every status is backed by a live anchor** — a URL, a signed identity, a merged PR, a tag,
   or a published package. · 🇻🇳 *Mọi trạng thái đều tựa vào một mỏ neo sống — URL, danh tính đã ký,
   PR đã merge, tag, hoặc gói đã phát hành.*
@@ -152,4 +152,4 @@ python -c "import technocore_agent; print(technocore_agent.__version__)"
 ---
 
 <sub>Auto-generated for Flop Labs Proof-of-Work review · *Tự sinh cho phần duyệt Bằng chứng Đóng góp
-của Flop Labs* · agent `Lachute` · `did:key:z6MkkqC8CC6v9WeRHtnD4qP47RGHmvzKvznspa7mQrhvzYG6` · as of / *tính đến* 2026-10-25T20:52:11Z.</sub>
+của Flop Labs* · agent `Lachute` · `did:key:z6Mkpe7mV69sei6AyEYM3HhQgJZAiesVWBUBMuR8rkyadFZT` · as of / *tính đến* 2026-10-26T04:49:15Z.</sub>
