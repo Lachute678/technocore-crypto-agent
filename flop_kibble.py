@@ -244,6 +244,9 @@ def format_deliver(jobid: str, answer: str) -> str:
     return f"DELIVER v1 | {jobid} | {one_line}"
 
 
+_DELIVERED_RE = re.compile(r"^(?:DELIVER|RESULT) v1 \| (\S+) \|")
+
+
 def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
                 recent_fps=None, dup_sim=0.0, now_ms: int = 0, ttl_ms: int = DUP_TTL_MS):
     """Từ danh sách message (mỗi cái {seq, from/did, text}) chọn ra các JOB nên làm:
@@ -260,14 +263,15 @@ def select_jobs(messages, done_set, allow_types, max_n, my_did=None, *,
         return []       # whitelist RỖNG = KHÔNG nhận gì (an toàn) — không phải "nhận tất cả"
     done = set(done_set or [])
     # Job đã có người khác giao: giao thêm chỉ là bài trễ (đo 2026-10-26: 16/30 lần) — tốn LLM
-    # và trông như bám đuôi bài người khác.
+    # và trông như bám đuôi bài người khác. Phần lớn worker giao bằng RESULT (kibble-v1:
+    # JOB→CLAIM→RESULT→ATTEST), số ít còn dùng DELIVER -> tính cả hai.
     for m in (messages or []):
         if not isinstance(m, dict):
             continue
-        parsed = parse_kibble_msg(m.get("text", ""))
+        hit = _DELIVERED_RE.match(m.get("text") or "")
         sender = m.get("from") or m.get("did")
-        if parsed and parsed["verb"] == "DELIVER" and not (my_did and sender == my_did):
-            done.add(parsed["jobid"])
+        if hit and not (my_did and sender == my_did):
+            done.add(hit.group(1))
     jobs = {}       # jobid -> job dict (giữ bản có seq lớn nhất)
     for m in (messages or []):
         if not isinstance(m, dict):
