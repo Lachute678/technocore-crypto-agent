@@ -3907,6 +3907,14 @@ def _respond_room(private_key, did, room, messages, last_seq, state, now, my_nic
     `room` này. `caps` = {'replies','proactive'} DÙNG CHUNG toàn run (trần toàn cục, chống
     burst đa room). Đây là vòng xử lý CŨ của auto_respond, tách ra để chạy cho từng room."""
     cursor = last_seq
+    if room_capped(room):
+        # Phòng hết hạn mức hôm nay: mọi tin đăng sẽ bị governor chặn. Không dựng câu trả lời
+        # (có thể gọi LLM) chỉ để bị chặn, và không đánh dấu peer "đã chào" khi lời chào không
+        # được đăng. Trước đây: ~17 lần chặn/lượt vì trần proactive chỉ đếm tin đăng THÀNH CÔNG.
+        seqs = [m.get("seq", 0) for m in messages if m.get("seq", 0) > last_seq]
+        if seqs:
+            print(f"[respond:{room}] phòng đã hết hạn mức hôm nay — bỏ qua {len(seqs)} tin (không phải lỗi)")
+        return max([cursor, *seqs])
     for m in sorted(messages, key=lambda x: x.get("seq", 0)):   # xét theo seq tăng dần
         seq = m.get("seq", 0)
         if seq <= last_seq:
@@ -4713,6 +4721,9 @@ def main():
     if TCLK_ENABLED and not TCLK_DRY_RUN and posts_degraded():
         tclk_status = "skip-outage"
         print(f"[tclk] bỏ qua — đường ghi lỗi (post ok={_post_ok_count} fail={_post_fail_count}).")
+    elif TCLK_ENABLED and not TCLK_DRY_RUN and room_capped(TCLK_ROOM):
+        tclk_status = "capped"
+        print(f"[tclk] r/{TCLK_ROOM} đã hết hạn mức hôm nay — chờ sang ngày UTC mới (không phải lỗi)")
     elif TCLK_ENABLED and _outcome_paused(state, "tclk", now):
         tclk_status = "paused"
         print(f"[tclk] TẠM DỪNG tự động tới {time.strftime('%Y-%m-%d %H:%M', time.gmtime(_outcome_paused(state, 'tclk', now)))} UTC — ACCEPT không ra kết quả")

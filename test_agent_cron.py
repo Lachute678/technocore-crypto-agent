@@ -3590,6 +3590,30 @@ def test_capped_room_skips_periodic_posts_without_failing(monkeypatch):
     assert ac.room_capped(ac.ROOM) is False
 
 
+def test_capped_room_skips_replies_without_building_them(monkeypatch):
+    # Lobby 20/20: mỗi lượt từng dựng ~17 câu trả lời/lời chào (có thể gọi LLM) rồi bị governor
+    # chặn, và peer bị đánh dấu "đã chào" dù lời chào không được đăng.
+    import flop_governor
+    monkeypatch.setattr(ac, "POST_GOVERNOR", True)
+    monkeypatch.setattr(ac, "PROACTIVE", True)
+    now = 1_800_000_000
+    ac._post_gov_state.clear()
+    ac._post_gov_state[flop_governor.KEY] = {"day": flop_governor._today(now),
+                                             "rooms": {ac.ROOM: 10_000}, "alerted": []}
+    monkeypatch.setattr(ac.time, "time", lambda: now)
+    built = []
+    monkeypatch.setattr(ac, "build_reply", lambda *a, **k: built.append("reply") or "x")
+    monkeypatch.setattr(ac, "proactive_engage", lambda *a, **k: built.append("proactive") or "x")
+    monkeypatch.setattr(ac, "post_message", lambda *a, **k: built.append("post") or False)
+    peer = "did:key:z6MkPeerPeerPeerPeerPeerPeerPeerPeerPeerPeer"
+    msgs = [{"seq": 11, "from": peer, "text": "gm everyone"},
+            {"seq": 12, "from": peer, "text": f"@{ac.HANDLE.lstrip('@')} what is btc doing?"}]
+    greeted, caps = [], {"replies": 0, "proactive": 0}
+    cur = ac._respond_room(None, "did:key:zMe", ac.ROOM, msgs, 10, {}, now, "me", greeted, caps)
+    assert cur == 12 and built == [] and greeted == [] and caps == {"replies": 0, "proactive": 0}
+    assert ac._respond_room(None, "did:key:zMe", ac.ROOM, [], 12, {}, now, "me", greeted, caps) == 12
+
+
 def test_faucet_cooldown_written_in_text_is_a_wait_not_an_error(monkeypatch):
     # Devnet 2026-10-24: "địa chỉ này vừa được cấp vốn; thử lại sau 1306 phút". Trước đây 4xx
     # như vậy -> error_claim -> gõ lại mỗi giờ (~22 lần bị từ chối/ngày).
