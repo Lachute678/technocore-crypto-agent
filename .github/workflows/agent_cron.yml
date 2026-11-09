@@ -100,7 +100,7 @@ jobs:
         env:
           AGENT_PRIVATE_KEY: ${{ secrets.AGENT_PRIVATE_KEY }}
           STATE_FILE: state.json
-          # Actions là runner DUY NHẤT (chạy chính mỗi 30'). Để 'backup' nếu sau này thêm
+          # Actions là runner DUY NHẤT (chạy chính mỗi 5'). Để 'backup' nếu sau này thêm
           # runner thứ 2 làm chính (xem cơ chế heartbeat trong agent_cron.py): khi đó Actions
           # tự ĐỨNG IM lúc runner chính còn sống, chỉ gánh khi chính sập.
           RUNNER_ROLE: ${{ vars.RUNNER_ROLE || 'primary' }}
@@ -118,8 +118,7 @@ jobs:
           KV_NS: ${{ vars.KV_NS }}
           # LLM tùy chọn — thêm 1 secret là bot tự thông minh hơn. Bỏ trống tất cả ->
           # agent tự fallback về template (vẫn chạy bình thường). Ở chế độ auto, thứ tự
-          # ưu tiên là Groq (chính) -> Gemini (phụ) -> DeepSeek -> OpenAI; provider chính lỗi
-          # lúc chạy sẽ tự lùi sang provider kế tiếp còn key.
+          # lấy từ LLM_PROVIDER_ORDER; provider lỗi lúc chạy sẽ tự lùi sang provider kế tiếp còn key.
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'auto' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -130,6 +129,8 @@ jobs:
           # groq,gemini,openrouter,deepseek,openai. Vd dồn sang Gemini/OpenRouter:
           #   LLM_PROVIDER_ORDER=gemini,openrouter,groq
           LLM_PROVIDER_ORDER: ${{ vars.LLM_PROVIDER_ORDER }}
+          # Trần số lần gọi provider trả phí (deepseek/openai) mỗi ngày UTC (mặc định 300, 0 = tắt).
+          FLOP_LLM_PAID_MAX_PER_DAY: ${{ vars.FLOP_LLM_PAID_MAX_PER_DAY }}
           # Model OpenRouter (gateway nhiều model, có bản :free). Rỗng -> dùng mặc định trong code.
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           # Để trống -> tự dò model Groq hợp lệ trên key (Groq hay đổi/deprecate model).
@@ -220,7 +221,7 @@ jobs:
           AGENT_ROOMS: ${{ vars.AGENT_ROOMS }}
           # Engage: chủ động hỏi 1 peer độc lập/run để sinh cạnh reply-distance (census).
           # Bật FLOP_ENGAGE_ENABLED=on -> DRY-RUN (log 'would ask') tới khi FLOP_ENGAGE_DRY_RUN=off.
-          # Loại fork nhà qua PROACTIVE_DENY_DIDS (bắt buộc đặt trước khi go-live để không ring).
+          # Loại DID bị chặn qua PROACTIVE_DENY_DIDS (bắt buộc đặt trước khi go-live để không ring).
           FLOP_ENGAGE_ENABLED: ${{ vars.FLOP_ENGAGE_ENABLED }}
           FLOP_ENGAGE_DRY_RUN: ${{ vars.FLOP_ENGAGE_DRY_RUN }}
           FLOP_ENGAGE_MAX_PER_RUN: ${{ vars.FLOP_ENGAGE_MAX_PER_RUN }}
@@ -298,11 +299,13 @@ jobs:
           FLOP_GATEWAY_PROMPTS: ${{ vars.FLOP_GATEWAY_PROMPTS }}
           FLOP_GATEWAY_PURPOSE: ${{ vars.FLOP_GATEWAY_PURPOSE }}
           FLOP_GATEWAY_MAX_CALLS_PER_RUN: ${{ vars.FLOP_GATEWAY_MAX_CALLS_PER_RUN }}
+          FLOP_GATEWAY_BRIEF: ${{ vars.FLOP_GATEWAY_BRIEF }}
           FLOP_GATEWAY_MAX_TOKENS: ${{ vars.FLOP_GATEWAY_MAX_TOKENS }}
           FLOP_GATEWAY_MAX_WAIT_MS: ${{ vars.FLOP_GATEWAY_MAX_WAIT_MS }}
           # Cảnh báo chi tụt lại: >PCT% cửa sổ trong >=ALERT_HOURS giờ -> Telegram (testnet).
           FLOP_GATEWAY_LAG_PCT: ${{ vars.FLOP_GATEWAY_LAG_PCT }}
-          # Quota tăng từ mức này trở lên = faucet nạp (mở cửa sổ chi mới); ít hơn = hoàn tiền.
+          # Quota tăng từ mức này trở lên = coi như allowance mới (mở cửa sổ chi mới); ít hơn = hoàn
+          # tiền. Faucet KHÔNG nạp quota: OpenAPI /enroll/wallet cấp 1 allowance/ví, không cấp lại.
           FLOP_GATEWAY_TOPUP_MIN: ${{ vars.FLOP_GATEWAY_TOPUP_MIN }}
           # % lượt nghỉ ngẫu nhiên (mặc định 10); nhiễu phần đến hạn dùng chung FLOP_PACE_JITTER_PCT.
           FLOP_GATEWAY_SKIP_PCT: ${{ vars.FLOP_GATEWAY_SKIP_PCT }}
@@ -316,6 +319,24 @@ jobs:
           FLOP_GATEWAY_CALL_GAP_SEC: ${{ vars.FLOP_GATEWAY_CALL_GAP_SEC }}
           FLOP_GATEWAY_RUN_INTERVAL_SEC: ${{ vars.FLOP_GATEWAY_RUN_INTERVAL_SEC }}
           FLOP_GATEWAY_MARGIN_SEC: ${{ vars.FLOP_GATEWAY_MARGIN_SEC }}
+          # Request timeout (không rõ server đã trừ tiền chưa): chờ biên nhận tối đa N giây (mặc
+          # định 1800) trước khi gọi mới — không gửi lại cùng đề.
+          FLOP_GATEWAY_INFLIGHT_TTL_SEC: ${{ vars.FLOP_GATEWAY_INFLIGHT_TTL_SEC }}
+          # Số lần phát lại request treo với cùng Idempotency-Key (mặc định 0 = tắt: chưa kiểm chứng
+          # gateway không tính phí lần phát lại).
+          FLOP_GATEWAY_REPLAY_MAX: ${{ vars.FLOP_GATEWAY_REPLAY_MAX }}
+          # Trần chi tuyệt đối của gateway, FLOP (mặc định 100/lượt, 2500/ngày UTC; 0 = tắt).
+          FLOP_GATEWAY_MAX_PER_RUN: ${{ vars.FLOP_GATEWAY_MAX_PER_RUN }}
+          FLOP_GATEWAY_MAX_PER_DAY: ${{ vars.FLOP_GATEWAY_MAX_PER_DAY }}
+          # Ngân sách FLOP tối đa cho MỖI allowance gateway (mặc định trống = rải cả quota; quota LÀ FLOP,
+          # devnet: tới 20.000 FLOP/24h do gateway cấp, không phải tiền ví). Trần ngày: MAX_PER_DAY.
+          FLOP_GATEWAY_BUDGET_FLOP: ${{ vars.FLOP_GATEWAY_BUDGET_FLOP }}
+          # Báo khi sổ đã ghi >= ngần này FLOP chi qua gateway mà explorer vẫn ghi ví mình 0 (mặc định 20).
+          FLOP_ATTRIB_ALERT_MIN: ${{ vars.FLOP_ATTRIB_ALERT_MIN }}
+          # Dừng mua khi sổ có >= GATE_MIN FLOP gateway settle mà chain chưa ghi cho ví (mặc định bật,
+          # ngưỡng = ALERT_MIN). off = mua tiếp dù chưa xác nhận.
+          FLOP_ATTRIB_GATE: ${{ vars.FLOP_ATTRIB_GATE }}
+          FLOP_ATTRIB_GATE_MIN: ${{ vars.FLOP_ATTRIB_GATE_MIN }}
           # Trần FLOPs MỘT phiên (tùy chọn) — phiên to hơn tách thành nhiều phiên.
           FLOP_SESSION_MAX_FLOPS: ${{ vars.FLOP_SESSION_MAX_FLOPS }}
           # (testnet) Trần phiên chờ proof: đủ N thì ngừng đăng phiên mới (mặc định 3, 0 = tắt).
@@ -327,6 +348,7 @@ jobs:
           # Radar testnet chỉ đọc (mặc định BẬT, 1 giờ/lần): route/trang/trạng thái mới -> Telegram.
           FLOP_TESTNET_RADAR: ${{ vars.FLOP_TESTNET_RADAR }}
           FLOP_TESTNET_RADAR_HOURS: ${{ vars.FLOP_TESTNET_RADAR_HOURS }}
+          FLOP_RADAR_EXPLORER_URL: ${{ vars.FLOP_RADAR_EXPLORER_URL }}
           # Bộ canh chi thật (testnet): báo Telegram sau N run liền không có phiên spent_onchain.
           FLOP_REAL_SPEND_ALERT_RUNS: ${{ vars.FLOP_REAL_SPEND_ALERT_RUNS }}
           FLOP_REAL_SPEND_REALERT_HOURS: ${{ vars.FLOP_REAL_SPEND_REALERT_HOURS }}
@@ -335,7 +357,7 @@ jobs:
           FLOP_POST_CAPS: ${{ vars.FLOP_POST_CAPS }}
           # Tính năng đăng tin phải có kết quả: tclk/engage quá thấp -> tự tạm dừng 7 ngày (mặc định BẬT).
           FLOP_OUTCOME_GUARD: ${{ vars.FLOP_OUTCOME_GUARD }}
-          # Đa dạng hóa request (chống bot/sybil): jitter ±% flops/latency/fee + xoay model list.
+          # Tham số mỗi phiên: lệch ±% flops/latency/fee + xoay model list.
           # Mặc định 20 (code), kẹp 0..50. MODEL_HASH nhận NHIỀU hash (CSV/'|') để xoay vòng.
           FLOP_SESSION_JITTER_PCT: ${{ vars.FLOP_SESSION_JITTER_PCT }}
           # Faucet (xin test token để CÓ số dư mà chi). FLOP_FAUCET_ENABLED=on + URL khi mở.
@@ -353,6 +375,22 @@ jobs:
           # Lượt faucet kế tiếp mở trong <= N giây thì chờ ngay trong run để claim đúng giờ (mặc định 300).
           FLOP_FAUCET_WAIT_MAX_SEC: ${{ vars.FLOP_FAUCET_WAIT_MAX_SEC }}
           FLOP_FAUCET_JITTER_MIN: ${{ vars.FLOP_FAUCET_JITTER_MIN }}
+          # Nội dung AI tuỳ chọn (mặc định TẮT). Trước đây code đọc các biến này nhưng workflow
+          # KHÔNG map -> đặt Repo Variable không có tác dụng gì.
+          FLOP_DIGEST_ENABLED: ${{ vars.FLOP_DIGEST_ENABLED }}
+          FLOP_RECAP_ENABLED: ${{ vars.FLOP_RECAP_ENABLED }}
+          FLOP_INSIGHT_ENABLED: ${{ vars.FLOP_INSIGHT_ENABLED }}
+          FLOP_ALERT_EXPLAIN_ENABLED: ${{ vars.FLOP_ALERT_EXPLAIN_ENABLED }}
+          DIGEST_LANG: ${{ vars.DIGEST_LANG }}
+          RECAP_LANG: ${{ vars.RECAP_LANG }}
+          ALERT_EXPLAIN_LANG: ${{ vars.ALERT_EXPLAIN_LANG }}
+          ALERT_MOVE_PCT: ${{ vars.ALERT_MOVE_PCT }}
+          MANIFEST_INTERVAL_HOURS: ${{ vars.MANIFEST_INTERVAL_HOURS }}
+          # Công khai tiến độ mở khoá vào KV note `unlock` (mặc định TẮT).
+          FLOP_PUBLISH_UNLOCK: ${{ vars.FLOP_PUBLISH_UNLOCK }}
+          # Đổi phòng board (rỗng -> mặc định kibble / tclk-offers).
+          FLOP_KIBBLE_ROOM: ${{ vars.FLOP_KIBBLE_ROOM }}
+          FLOP_TCLK_ROOM: ${{ vars.FLOP_TCLK_ROOM }}
           # Câu hỏi nhập tay khi Run workflow (bỏ qua khi chạy theo cron)
           ASK: ${{ github.event.inputs.ask }}
           # Chỉ ép telemetry khi TICK ô force_broadcast lúc chạy tay — KHÔNG suy từ event_name,

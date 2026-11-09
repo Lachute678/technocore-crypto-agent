@@ -142,6 +142,24 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
   books nothing. It needs a funded devnet wallet (>= 1 FLOP from faucet.flop.network) and
   each account gets one 24 h allowance only, so it is a one-day dry run.
 
+### Spend attribution gate
+
+Yellow Paper R8.4 scores "settled compute-channel spend", and channels opened through the gateway
+were measured under the gateway's broker account, not the enrolled wallet (`yellowpaper#172` has no
+maintainer answer). So gateway spend is booked as `gateway_unattributed`: it stays out of the airdrop
+metric and the wallet balance until the explorer shows spend under the wallet. Unconfirmed exposure,
+including pending receipts and hung requests, is limited to `max(FLOP_ATTRIB_GATE_MIN, confirmed on
+chain)` FLOP (default minimum 20), so a tiny confirmed amount cannot open the gate for a large one. At
+that limit, or once a settled channel names another account, the agent stops buying
+(`gateway/attribution_hold`, Telegram once a day) and resumes by itself when the chain confirms.
+`FLOP_ATTRIB_GATE=off` overrides this if FLOP states that gateway spend counts.
+
+The wallet-owned path (`open_channel` through the official SDK or CLI) is not implemented: it needs
+a reachable miner endpoint or signed offer, and devnet has none to test against. `/enroll/*` is also
+documented "Devnet only": a gateway without it yields `gateway/enroll_unavailable` and an alert, and
+needs an adapter for the published testnet API. The mempool scaffold is refused on testnet
+(`blocked-mempool`) because it pays by a transfer with no recipient, not through channel escrow.
+
 ### Day-one checklist (Variables only — no code change)
 1. `TESTNET_ENABLED=true` **first**; `FLOP_TESTNET_START=2026-11-03` (or the confirmed
    date). The faucet refuses to claim while the ledger is in simulation mode
@@ -199,8 +217,8 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
    `FLOP_SESSION_MAX_PER_RUN=3`, `FLOP_INFERENCE_COST` + `FLOP_SESSION_FLOPS`.
 6. Watch the first runs (or ask for a log check): `[faucet] +N FLOP … tx=…` then
    `[gateway] enroll ví 5CFP…`, `[session] N✓ gateway/spent … quota=…`, and one run later
-   `[gateway] biên nhận: settled +N (X FLOP)` - that settled amount is what the ledger books
-   as compute purchased. `gateway/pace_wait` between buys is normal. Outcomes that need
+   `[gateway] biên nhận: settled +N (X FLOP)` - that amount is booked as **unconfirmed** until the
+   explorer shows it under the wallet (see "Spend attribution gate"). `gateway/pace_wait` between buys is normal. Outcomes that need
    action: `network_mismatch` (set `FLOP_GATEWAY_URL`/`FLOP_GATEWAY_NETWORK`),
    `payment_required` (x402 - the agent never pays by itself; fit by hand), `unfunded` (faucet
    not reaching the DID wallet), `price_unknown` (item 5). The daily Telegram report carries a
@@ -210,7 +228,7 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
    buyers choose ("buyers choose their miners"; "pick a capable miner"), but no miner
    list, price, status or error history is published yet, so do not guess weights. Build
    it from the real API fields, in this priority order:
-   1. **Filter:** serves the pinned model, meets the latency bound, not a fleet miner
+   1. **Filter:** serves the pinned model, meets the latency bound, not a deny-listed miner
       (`PROACTIVE_DENY_DIDS` — "Independent demand only"), not recently failed/challenged.
    2. **Spread:** cap any one miner's share of our sessions (the `[miners]` concentration
       line already measures it; warning at `FLOP_MINER_CONC_WARN`). Prefer the eligible
@@ -225,7 +243,7 @@ exactly), 5 miners, an 8-line `flop-devnet-enroll/v1` challenge naming our SS58 
         in floating-point operations"*): a cheaper miner buys more compute for the same
         faucet FLOP, so a lower FLOP-per-FLOPs price directly raises the score. Then rank by
         price per FLOPs among the miners that pass step 1, still under the step-2 spread cap
-        and never a fleet miner.
+        and never a deny-listed miner.
       Until the spec settles it, log price per FLOPs for every settled session so the choice
       can be made from real data on day one.
    Never skip a session to "save budget": unspent faucet FLOP is lost ("If you don't use

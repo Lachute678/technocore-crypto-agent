@@ -106,16 +106,17 @@ def test_select_skips_jobs_another_worker_already_delivered():
     assert [j["jobid"] for j in jobs] == ["k0000000012", "k0000000011"]
 
 
-def test_select_skips_jobs_posted_by_fleet_dids():
-    # Làm job do agent cùng nhà đăng = tự mua-bán (sybil). tclk/session đã lọc fleet, kibble thì chưa.
+
+def test_select_skips_jobs_posted_by_deny_listed_dids():
     msgs = [
-        _msg(50, "JOB v1 | k0000000020 | explain | fleet job | x", frm="did:key:zFleet"),
-        _msg(51, "JOB v1 | k0000000021 | explain | stranger job | x"),
+        _msg(50, "JOB v1 | k000000001a | explain | denied | x", frm="did:key:zDENIED"),
+        _msg(51, "JOB v1 | k000000001b | explain | ok | x"),
     ]
     jobs = k.select_jobs(msgs, done_set=set(), allow_types=["explain"], max_n=5,
-                         deny_dids={"did:key:zFleet"})
-    assert [j["jobid"] for j in jobs] == ["k0000000021"]
-    assert len(k.select_jobs(msgs, set(), ["explain"], 5)) == 2          # không có deny -> như cũ
+                         deny_dids={"did:key:zDENIED"})
+    assert [j["jobid"] for j in jobs] == ["k000000001b"]
+    # không truyền deny_dids -> hành vi cũ, nhận cả hai
+    assert len(k.select_jobs(msgs, done_set=set(), allow_types=["explain"], max_n=5)) == 2
 
 
 # --- run_kibble_worker (orchestrator, fake deps) ----------------------------------
@@ -149,6 +150,22 @@ def test_run_dry_run_posts_nothing_but_advances_cursor():
     assert out["delivered"] == ["k000000000d"]
     assert state["kibble_cursor"] == 30                 # cursor vẫn tiến
     assert state.get("kibble_done", []) == []           # DRY: không ghi done
+
+
+def test_run_never_claims_a_job_posted_by_a_deny_listed_did():
+    msgs = [_msg(45, "JOB v1 | k000000001c | explain | T | body", frm="did:key:zDENIED")]
+    posts, asked = [], []
+    state = {}
+    out = k.run_kibble_worker(
+        fetch_fn=_fetch(msgs, 45),
+        answer_fn=lambda job: asked.append(job) or "the answer",
+        post_fn=lambda text: posts.append(text) or True,
+        state=state, allow_types=["explain"], do_claim=True, dry_run=False,
+        log=lambda *_: None, deny_dids=["did:key:zDENIED"],
+    )
+    assert posts == [] and asked == []                  # không CLAIM, không tốn inference
+    assert out["delivered"] == []
+    assert state["kibble_cursor"] == 45                 # cursor vẫn tiến qua job đó
 
 
 def test_run_live_claims_delivers_and_records_done():
@@ -504,3 +521,53 @@ def test_one_failing_job_does_not_abort_the_batch():
                                post_fn=lambda t: posts.append(t) or True, state=st,
                                allow_types=["explain"], max_per_run=3, do_claim=True, dry_run=False)
     assert len(out["delivered"]) == 2 and out["skipped"] == 1
+
+
+# --- CLAIM treo: DELIVER lỗi sau CLAIM -> giao lại run sau; hết hạn mức -> không bắt đầu job --------
+
+def test_deliver_failure_after_claim_is_retried_next_run():
+    msgs = [_msg(70, "JOB v1 | k000000002a | explain | T | body")]
+    state, posts, answers = {}, [], []
+    deliver_ok = {"v": False}
+
+    def post(text):
+        posts.append(text)
+        return True if text.startswith("CLAIM") else deliver_ok["v"]
+
+    def answer(job):
+        answers.append(job["jobid"])
+        return "the answer"
+    k.run_kibble_worker(fetch_fn=_fetch(msgs, 70), answer_fn=answer, post_fn=post, state=state,
+                        allow_types=["explain"], dry_run=False, now_ms=1_000, log=lambda *_: None)
+    assert state["kibble_pending"][0]["jobid"] == "k000000002a"
+    assert state.get("kibble_done", []) == []
+    # Run sau: board đã cuộn (không còn JOB), DELIVER giao lại từ hàng chờ, KHÔNG suy luận lại.
+    deliver_ok["v"] = True
+    posts.clear()
+    out = k.run_kibble_worker(fetch_fn=_fetch([], 70), answer_fn=answer, post_fn=post, state=state,
+                              allow_types=["explain"], dry_run=False, now_ms=2_000, log=lambda *_: None)
+    assert posts == ["DELIVER v1 | k000000002a | the answer"]
+    assert answers == ["k000000002a"]
+    assert out["delivered_items"] == [{"jobid": "k000000002a", "answer": "the answer"}]
+    assert state["kibble_done"] == ["k000000002a"] and state["kibble_pending"] == []
+
+
+def test_pending_deliver_expires():
+    state = {"kibble_pending": [{"jobid": "k000000002b", "answer": "a", "ts": 0}]}
+    posts = []
+    k.run_kibble_worker(fetch_fn=_fetch([], 1), answer_fn=lambda j: "x",
+                        post_fn=lambda t: posts.append(t) or True, state=state,
+                        allow_types=["explain"], dry_run=False, now_ms=k.PENDING_TTL_MS + 1,
+                        log=lambda *_: None)
+    assert posts == [] and state["kibble_pending"] == []
+
+
+def test_no_quota_for_claim_and_deliver_stops_before_inference():
+    msgs = [_msg(80, "JOB v1 | k000000002c | explain | T | body")]
+    posts, answers = [], []
+    k.run_kibble_worker(fetch_fn=_fetch(msgs, 80),
+                        answer_fn=lambda j: answers.append(j) or "a",
+                        post_fn=lambda t: posts.append(t) or True, state={},
+                        allow_types=["explain"], dry_run=False, log=lambda *_: None,
+                        can_post_fn=lambda n: n <= 1)          # còn đúng 1 tin hôm nay
+    assert posts == [] and answers == []

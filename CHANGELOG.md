@@ -7,7 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The daily spend counter no longer keeps the full reserve of a request whose outcome was unknown
+  (a timeout or HTTP 524). The reserve is still counted at once, so the daily cap cannot be overrun.
+  Once the receipt is reconciled, the reserve is replaced by the settled amount, or by 0 if the request
+  was released. A receipt that is still pending keeps the reserve until it settles. Before, the counter
+  ran about 0.3-0.8 FLOP high per incident (3.9 when the request was released), and a replayed answer
+  was counted on top of its reserve. A reserve from an earlier UTC day leaves today's counter alone.
+- Switching the gateway wallet on the same network (a new rehearsal seed) now starts that wallet
+  clean. The old wallet's bearer, allowance window, lag episode, backoff, receipts and learned request
+  size used to carry over. On devnet (2026-11-06) the old 128-token cap truncated every answer of the new
+  wallet although `FLOP_GATEWAY_MAX_TOKENS` was 512, and a stale "20000 FLOP behind" line kept being
+  logged. Cumulative stats, prompt rotation, recent error ids and the operator's daily spend are kept.
+- A learned request-size cap now expires together with the rejection it came from (one day). Before,
+  it stayed until 12 consecutive successes, which an overloaded gateway never delivers. A repeat
+  rejection at the same size refreshes the rejection's timestamp, so an expired cap is relearned rather
+  than retried at the rejected size every run.
+- The gateway quota is FLOP again. `flop.network/llms.txt` says each address gets "a quota of up to
+  20,000 devnet FLOP that expires after 24 hours", gateway credit rather than the wallet balance. The
+  earlier heuristic (quota more than 4x the wallet balance means it is not FLOP) capped the allowance at
+  the wallet's 25 FLOP, so it is removed together with the explorer balance read and
+  `FLOP_GATEWAY_ALLOWANCE_FLOP`. `FLOP_GATEWAY_BUDGET_FLOP` stays as an optional per-allowance cap (a
+  neutral `budget_spent` outcome). After each paid call the charged amount is compared with token x
+  list price, to settle whether the price is per token or per 1K tokens.
+- Once an allowance is paced by a FLOP budget, it stays that way until the next enrollment. A growing
+  wallet (2000 FLOP a day from the verified faucet tier) used to make a 20000 quota look like FLOP again
+  after about three days, so spend was measured in quota units and the daily cap stopped after a few
+  real FLOP. A new allowance uses the measured quota-per-FLOP ratio, when known, instead of the balance.
+- Gateway pacing no longer treats `remaining_quota` as FLOP when it plainly is not (devnet 2026-11-04:
+  every key gets 20000 while the wallet holds 25 FLOP). With a readable wallet balance, a quota more than
+  4x the balance switches pacing to a FLOP budget per allowance (wallet balance, or
+  `FLOP_GATEWAY_BUDGET_FLOP`; `FLOP_GATEWAY_ALLOWANCE_FLOP`, default 25, until the balance is read).
+  Spend is priced from usage tokens instead of the quota drop, and the quota-per-FLOP ratio is logged.
+  Before, the pacer targeted ~11,000 FLOP a day and would have spent the whole balance within hours of
+  the gateway recovering.
+- The default completion size is 512 tokens instead of the model limit (8192); `FLOP_GATEWAY_MAX_TOKENS`
+  still raises it up to the model limit.
+- `429 overloaded` / "gateway channel pool is full" (flop-labs/network#31) is its own `overloaded`
+  outcome. It backs off for 240 s so the next run retries, is neutral for the real-spend watchdog, and
+  never sends the spend-lag Telegram alert (it is still logged).
+- Failed gateway requests log `req=<id>` (the gateway `request_id`, else our `Idempotency-Key`), and the
+  last 20 are kept in state for bug reports.
+- A `settled` gateway receipt whose `settled_spend` and `settled_spend_raw` are still null (OpenAPI:
+  "unknown", never zero) is kept open and booked once the gateway fills the amount; it was marked seen
+  at 0 FLOP and never booked.
+- An exhausted gateway allowance now raises the real-spend alert instead of counting as a normal wait:
+  the OpenAPI says a wallet allowance is never renewed, and the faucet funds the wallet, not the quota.
+  `exhausted`/`unfunded` error codes match regardless of case (an upper-case code was reported as x402).
+- A hung gateway request is reconciled by its send time when the receipt `request_id` is not the
+  `Idempotency-Key` (the OpenAPI does not declare that header for `/chat/completions`), instead of
+  blocking new calls for 30 minutes. Only a single unambiguous receipt of the same model is accepted.
+- An LLM key rejected with 400/403 and a key error (Google's "API key not valid") marks the provider
+  dead for the run, like 401/402; Gemini and Groq stop walking models on a rejected key. The Groq model
+  walk is capped by `GROQ_MAX_TRIES` (6) and respects the run budget.
+- Gateway receipts in an unknown state (for example `streaming`) are no longer booked as settled just
+  because they carry `settled_spend`; they are tracked as open (counted by the attribution gate) and
+  booked once settled. Only receipts with no `state` field are trusted by amount.
+- A faucet reply with no amount is counted as a claim but never booked at `FLOP_FAUCET_AMOUNT` (default
+  100, while the quick tier grants 25); the chain balance is the reference.
+- Wallet readings from the explorer survive a failed radar Telegram alert, and are still taken every
+  radar period on testnet when `FLOP_TESTNET_RADAR=off`, so the attribution gate does not stop buying on
+  stale data.
+- An explorer spend reading with no read time is treated as stale, not fresh, when confirming that
+  gateway spend stands under the wallet.
+- Daily report labels: simulated compute, seed credits and miners are named as simulated, and confirmed
+  testnet compute no longer reads as "counted". The day count and projection need testnet mode plus
+  `FLOP_TESTNET_START`. `kibble` and `session` lines say they are the last run, and room share names
+  its sample size.
+- Miner statistics survive `state.json` loss through their own signed KV key, trimmed to fit its limit.
+- **Spend-path audit.** Gateway spend is no longer reported as on-chain or counted in the airdrop
+  metric until the explorer confirms it under the wallet (`gateway_settled_unverified`), and buying
+  stops after `FLOP_ATTRIB_GATE_MIN` FLOP unconfirmed. Failed runs keep their receipt results, so
+  miner stats and foreign-channel alerts are not lost and booked spend is persisted at once. A hung
+  request restored from KV is reconciled instead of dropped, a hung kibble job is not sent again,
+  and an empty catalog keeps the bearer. Malformed `usage` no longer loses a paid response; receipts
+  with only `settled_spend_raw` are booked; receipts that leave the response unsettled are counted.
+- Gemini empty replies fall back to the next provider; brief answers pass `guard_output`.
+- `import technocore_agent` crashed after `claim_mainnet_unlock` was removed; CI now imports the package.
+- Booked spend is saved before receipts are marked seen, so a run cancelled mid-call cannot lose it.
+- The attribution gate counts pending receipts and hung requests, caps each run by the room left, and
+  a small confirmed amount no longer opens it. The daily cap and the replay stop survive `state.json`
+  loss. A named network such as `flop-testnet-1` maps to the right explorer.
+- Gemini tries at most `GEMINI_MAX_TRIES` models per reply and respects the run budget; paid LLM calls
+  are capped by `FLOP_LLM_PAID_MAX_PER_DAY`.
+- The report no longer counts gateway calls as LLM metering and flags a ledger/chain balance gap; a
+  stale explorer balance is ignored; hydrate keeps the ledger with the most confirmed spend.
+- `TESTNET_ENABLED` with a non-testnet `FLOP_GATEWAY_NETWORK` refuses to buy.
+
+### Changed
+- `FLOP_GATEWAY_REPLAY_MAX` defaults to `0`. New hard caps `FLOP_GATEWAY_MAX_PER_RUN` (100) and
+  `FLOP_GATEWAY_MAX_PER_DAY` (2500). The mempool backend is refused on testnet.
+- `unlock_status()` returns `unlock_estimate` (reference only) instead of `unlocked_mainnet`,
+  `claimed_mainnet` and `claimable`: 3:1 unlocks the locked grant after genesis, not testnet spend.
+
+### Removed
+- **`token_manager.claim_mainnet_unlock()`** and `FLOP_MAINNET_CLAIM_URL`: nothing called them, and
+  the published design credits allocations at genesis with no claim step.
+- **`flop_stake.py` and `flop_units.py`** (and their tests) — neither was wired into the agent
+  (`agent_cron` never imported them; `FLOP_STAKE_ENABLED` was not mapped in the workflow). FLOP has
+  not published a staking API. Ledgers keep their `stake` key so any old delegated position is not
+  lost on hydrate. Breaking for SDK users who imported these modules directly.
+- **`agent_cron.get_prices()`** — unused back-compat wrapper; use `get_market(["bitcoin", "ethereum"])`.
+- **`deploy/GO-LIVE.md`** — mempool-era runbook superseded by STRATEGY.md's gateway day-one checklist.
+
+### Changed
+- Coverage now measures every shipped module (it skipped `flop_gateway`, `flop_session` and others);
+  `test_packaging` keeps the list in sync.
+
 ### Added
+- The testnet radar reports new commits to `flop-labs/yellowpaper` (Arthur Hayes, 2026-11-05: "have your agent monitor the yellow paper git repo for changes"), with the commit messages,
+  the changed files and a compare link. The first run only records the current head.
 - **Multi-room listen & respond (`AGENT_ROOMS`).** `auto_respond` can now listen and reply across
   a CSV list of rooms (e.g. `lobby,meta,flop`) in one run, each reply routed back to the room it
   came from. Kept **synchronous** (the codebase is `requests` + 5-min cron — fetching a few rooms

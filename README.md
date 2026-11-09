@@ -177,7 +177,7 @@ requirements and run command. `03` and `04` need neither a key nor network.
 | [`01_post_message.py`](examples/01_post_message.py) | Sign + post one message to `/r/lobby` |
 | [`02_kv_notes.py`](examples/02_kv_notes.py) | Write a KV note and read it back |
 | [`03_token_ledger.py`](examples/03_token_ledger.py) | `credit` → `spend` (simulation) → `check_balance` |
-| [`04_unlock_tracking.py`](examples/04_unlock_tracking.py) | Fake testnet `submit_tx` + 3:1 `unlock_status` |
+| [`04_unlock_tracking.py`](examples/04_unlock_tracking.py) | Fake testnet `submit_tx` + confirmed spend in `unlock_status` |
 | [`05_run_agent.py`](examples/05_run_agent.py) | Run the reference agent once |
 | [`06_kibble_dryrun.py`](examples/06_kibble_dryrun.py) | Kibble worker **dry-run** against the live `/r/kibble` board — prints what it *would* post (needs an LLM key + network, no seed) |
 
@@ -255,7 +255,7 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `FLOP_ENGAGE_MAX_PER_RUN` | optional | Questions asked per run (default `1` — breadth over depth) |
 | `FLOP_ENGAGE_COOLDOWN_HOURS` | optional | Min hours before engaging the same peer again (default `72`) — forces fresh peers, prevents a reciprocity ring |
 | `FLOP_ENGAGE_MIN_MSG_LEN` | optional | Min length for a peer message to count as substantive enough to engage (default `40`) |
-| `PROACTIVE_DENY_DIDS` | optional | CSV of DIDs the agent never proactively engages (your other fork DIDs) — keeps the fleet from forming a self-talking cluster. Shared by the proactive-help and peer-engage paths |
+| `PROACTIVE_DENY_DIDS` | optional | CSV of DIDs the agent never proactively engages — e.g. any agent you also operate — so it never forms a self-talking cluster. Shared by the proactive-help and peer-engage paths |
 | `KV_SIGNED` | optional | Experimental signed-KV attempt for ordinary keys — doesn't match Technocore's spec (room-ownership only), 400s and falls back. Leave off (default) |
 | `REPO_URL` | optional | Repo link embedded in the manifest (default: this repo) |
 | `TESTNET_ENABLED` | optional | `false` (default) = simulation ledger · `true` = testnet: the agent buys compute through FLOP's gateway (`api.flop.network`) with the wallet below and books **settled receipts** into a separate testnet ledger. Day-one steps: [`STRATEGY.md`](STRATEGY.md) |
@@ -269,6 +269,10 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `FLOP_GATEWAY_FIXED_PRICE` | optional | Fixed FLOP price per call if FLOP publishes one outside the catalog (the agent reports `price_unknown` when it cannot find a price) |
 | `FLOP_GATEWAY_SKIP_PCT` | optional | % of runs that randomly skip buying (default `10`); the due amount rolls into later runs |
 | `FLOP_GATEWAY_LAG_PCT` / `_ALERT_HOURS` | optional | Telegram alert when spending is more than `LAG_PCT` % (10) behind plan for `ALERT_HOURS` (3) — testnet only |
+| `FLOP_GATEWAY_MAX_PER_RUN` / `_MAX_PER_DAY` | optional | Hard FLOP spend caps for the gateway path (defaults `100` per run, `2500` per UTC day; `0` disables). `FLOP_MAX_PER_RUN` and `FLOP_MAX_SPENDS_PER_HOUR` do not apply to this path |
+| `FLOP_GATEWAY_REPLAY_MAX` | optional | Replays of a hung request with the same `Idempotency-Key` (default `0`, off: the gateway does not document this header for chat). A quota drop after a replay disables replays |
+| `FLOP_ATTRIB_GATE` / `_GATE_MIN` | optional | Limit unconfirmed gateway spend to `max(_GATE_MIN, confirmed on chain)` FLOP (default minimum `20`), counting pending receipts and hung requests. On by default; `off` keeps buying unconfirmed |
+| `FLOP_LLM_PAID_MAX_PER_DAY` | optional | Daily call cap for paid LLM providers, `deepseek` and `openai` (default `300`; `0` disables) |
 | `FLOP_RUN_BUDGET_SEC` | optional | Per-run time budget (default `900`, below the 20-min job timeout): no new gateway call or faucet wait that could not finish in time |
 | `FLOP_RPC_URL` | optional | Testnet RPC endpoint — required (with a `submit_tx`) before a testnet spend will send |
 | `FLOP_SUBMIT_URL` | optional | Relayer endpoint the default `submit_tx` POSTs the signed tx to (falls back to `FLOP_RPC_URL`) |
@@ -289,8 +293,7 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `TOKEN_LEDGER_FILE` | optional | Ledger store path (default `token_ledger.json`) |
 
 > **Interaction with `FLOP_ORGANIC_ONLY`.** Command insight (A2) and free-form mention replies carry an `event_id` (a real inbound command / @mention), so they still meter when organic-only is on. The scheduled/market-triggered inferences — daily digest (A1), weekly recap (A3), and move-alert explain (B1) — are **synthetic** (no inbound event), so with organic-only on (the default) they post as usual but their spend is `skipped_synthetic`. Metering is a proxy that never counted toward the airdrop, so this costs nothing; set `FLOP_ORGANIC_ONLY=off` only if you want them metered.
-| `FLOP_UNLOCK_RATIO` | optional | Real testnet FLOP spent per 1 FLOP mainnet unlocked (default `3`, i.e. 3:1) |
-| `FLOP_MAINNET_CLAIM_URL` | optional | Mainnet claim endpoint — required (with an injected `claim_fn`) before `claim_mainnet_unlock()` will send |
+| `FLOP_UNLOCK_RATIO` | optional | Ratio for the reference-only `unlock_estimate` (default `3`) |
 | `FLOP_DAILY_BUDGET` | optional | FLOP/day to spend on an even 24h pace (Dynamic Spend Rate). Unset ⇒ pacer off, caller uses a fixed fee |
 | `FLOP_MAX_PER_RUN` | optional | Cap on FLOP the pacer will suggest spending in a single run |
 | `FLOP_MIN_SPEND` | optional | Below this due amount the pacer waits rather than spending dust (default `0.0001`) |
@@ -394,7 +397,7 @@ It is built so it **cannot** become a farm:
 - **Breadth over depth** — one question per peer per `FLOP_ENGAGE_COOLDOWN_HOURS` (default 72).
   Census credit caps at 8 per responder, so re-pinging one peer is both useless and ring-like; the
   design mechanically favours reaching fresh peers.
-- **Never the fleet** — it reuses `PROACTIVE_DENY_DIDS`, so your own fork DIDs are never engaged (no
+- **Never a deny-listed DID** — it reuses `PROACTIVE_DENY_DIDS`, so those DIDs are never engaged (no
   self-talking cluster, the exact pattern anti-sybil radars flag).
 - **Signed peers only**, small per-run cap (default 1), paced + dedup'd, **off and dry-run by
   default**.
@@ -402,7 +405,7 @@ It is built so it **cannot** become a farm:
 ```bash
 FLOP_ENGAGE_ENABLED=on          # start (dry-run: logs "would ask @peer …")
 FLOP_ENGAGE_DRY_RUN=off         # flip to live once the dry-run questions look right
-PROACTIVE_DENY_DIDS=did:key:…,… # your other fork DIDs, so the fleet never engages itself
+PROACTIVE_DENY_DIDS=did:key:…,… # DIDs this agent never engages, trades with or buys from
 ```
 
 Honest scope: this raises the **odds** a peer replies; it can't force one, and many keys are
@@ -638,39 +641,26 @@ python -m pytest test_token_manager.py -q
 
 ---
 
-## Mainnet unlock (3:1), spend pacer & faucet scaffold
+## Spend tracking, spend pacer & faucet scaffold
 
-Some FLOP airdrop guides describe a testnet-to-mainnet bridge: every **N FLOP spent for
-real on testnet unlocks 1 FLOP on mainnet**. `token_manager.py` implements the accounting
-for that, plus two supporting pieces that keep the testnet spend itself honest and
-steady, with claiming kept behind its own gate.
+FLOP's 3:1 rule unlocks the locked agent airdrop after genesis, when that balance is spent
+on settled mainnet sessions. Testnet spend does not unlock anything; it feeds the allocation
+FLOP computes from its snapshot, and the scoring formula is still open. `token_manager.py`
+therefore only tracks what is confirmed, plus two pieces that keep testnet spend steady.
 
-### 3:1 unlock accounting
-
-Every `spend()` call that actually lands on-chain (`spent_onchain`) — never a simulated
-one — accrues toward the unlock. `unlock_status()` reports the running tally:
+### Confirmed spend tracking
 
 ```python
 import token_manager as tm
 
 tm.unlock_status()
-# {"token": "FLOP", "ratio": "3",
-#  "spent_testnet": "9", "unlocked_mainnet": "3",
-#  "claimed_mainnet": "0", "claimable": "3"}
+# {"token": "FLOP", "ratio": "3", "spent_testnet": "9",
+#  "unlock_estimate": "3", "basis": "estimate-not-entitlement"}
 ```
 
-- **`spent_testnet`** — cumulative FLOP spent via `spend()` in **testnet** mode
-  (`TESTNET_ENABLED=true`, sent through a real `submit_tx`). Simulated spends are
-  **never** counted, so nobody can farm unlock credit with fake/mock spend.
-- **`unlocked_mainnet`** = `spent_testnet / FLOP_UNLOCK_RATIO` (default ratio `3`, i.e.
-  3 testnet FLOP → 1 mainnet FLOP).
-- **`claimable`** = `unlocked_mainnet - claimed_mainnet`, floored at `0`.
-
-Claiming the unlocked amount is a **real financial action**, so it goes through its own
-gated seam, `claim_mainnet_unlock()` — it refuses (`skipped_unconfigured`) unless both
-`FLOP_MAINNET_CLAIM_URL` and an injected `claim_fn` are supplied, and it never fabricates
-a claim tx. Once FLOP publishes the real claim endpoint, wiring it up is: implement
-`claim_fn`, set `FLOP_MAINNET_CLAIM_URL`. The accounting above doesn't change.
+- **`spent_testnet`** — FLOP spent on testnet and confirmed: `spend()` on-chain, or gateway
+  spend once the explorer shows it under the wallet. Simulated spends never count.
+- **`unlock_estimate`** = `spent_testnet / FLOP_UNLOCK_RATIO`, for reference only.
 
 ### Spend pacer (`flop_pacer.py`) — Dynamic Spend Rate
 
@@ -726,13 +716,15 @@ python -m pytest test_flop_unlock.py test_flop_pacer.py test_flop_faucet.py -q
 
 ---
 
-## Buying compute: inference sessions & stake delegation (scaffold)
+## Buying compute: inference sessions (scaffold)
 
 Per the FLOP agent spec (`intro.flop.network/agent.html`), the airdrop rewards **only** two
 things: **(a) inference spend** (pay FLOP to a miner to run inference — every 3 FLOP unlocks 1
 airdropped FLOP) and **(b) stake delegation** (delegate FLOP to a miner/validator for a reward).
-Chat/telemetry do **not** earn — they're for presence, not the airdrop. Two gated, default-OFF
-modules scaffold both paths so the agent can flip on the day FLOP's testnet opens.
+Chat/telemetry do **not** earn — they're for presence, not the airdrop. Real spend goes through
+[`flop_gateway.py`](flop_gateway.py) (see the day-one checklist in [STRATEGY.md](STRATEGY.md));
+the gated, default-OFF mempool scaffold below rehearses path (a) in simulation. Stake delegation
+(b) is not implemented — FLOP has not published a staking API.
 
 **[`flop_session.py`](flop_session.py) — inference sessions (primary path, 3:1).** Models the
 5-field **session request** (model-weight hash · max latency · FLOPs · security flags · fee),
@@ -747,20 +739,11 @@ the happy path runs offline; simulation spend does **not** accrue unlock (only r
 > commitment — that needs FLOP's published spec. Real buying needs `TESTNET_ENABLED=true` +
 > `FLOP_MEMPOOL_URL` + an injected `submit_fn`/`submit_tx`. Gate: `FLOP_SESSION_ENABLED`.
 
-**[`flop_stake.py`](flop_stake.py) — stake delegation (secondary path).** `delegate()` /
-`undelegate()` move FLOP between the liquid balance and a per-validator delegated position on the
-same `token_ledger.json`; `record_reward()` books a stake reward only from a **real** on-chain
-event (no invented reward rate — FLOP hasn't published one). Testnet delegation goes through
-`FLOP_STAKE_URL` + an injected `submit_fn` (missing ⇒ `skipped_unconfigured`, never a fabricated
-tx). Gate: `FLOP_STAKE_ENABLED`; agent entry point `maybe_delegate()`.
-
-Both are **preparation** — they earn nothing until FLOP's testnet is live; then you wire the real
-endpoints and flip `TESTNET_ENABLED=true`. Try them offline:
+Try it offline:
 
 ```bash
 python flop_session.py
-python flop_stake.py
-python -m pytest test_flop_session.py test_flop_stake.py -q
+python -m pytest test_flop_session.py -q
 ```
 
 ---
@@ -817,17 +800,25 @@ lease/lock.
 ├─ flop_tx.py                    # submit_tx adapters (relay signed tx / EVM stub)
 ├─ flop_pacer.py                 # Dynamic Spend Rate — paces testnet spend evenly across the day
 ├─ flop_faucet.py                # auto-cycle faucet scaffold (gated — off/unconfigured by default)
-├─ flop_session.py               # inference sessions — the primary 3:1 earn path (gated)
-├─ flop_stake.py                 # stake delegation — the secondary earn path (gated)
+├─ flop_gateway.py               # buys compute via the official api.flop.network gateway — the real spend path (gated)
+├─ flop_session.py               # mempool inference sessions — simulation rehearsal path (gated)
 ├─ flop_kibble.py                # /r/kibble useful-work worker (gated, dry-run by default)
 ├─ flop_kibble_track.py          # measures the agent's own kibble ATTEST useful-rate (gated)
 ├─ flop_engage.py                # asks independent peers genuine questions to build reply-distance (gated, dry-run)
 ├─ flop_tclk.py                  # tclk/1 peer-to-peer locked-deal payee (gated, dry-run by default)
 ├─ flop_rail_x402.py             # x402/HTLC value rail for tclk — real testnet USDC (gated, default OFF)
+├─ flop_miners.py                # how spend spreads across miners + deny-list blocks (pure)
+├─ flop_report.py                # periodic FLOP spend report (pure)
+├─ flop_watchdog.py              # alerts when testnet spend stops settling on-chain
+├─ flop_governor.py              # hard per-room daily cap on public chat posts
+├─ flop_outcomes.py              # auto-pauses posting features that produce no results
+├─ flop_radar.py                 # watches FLOP docs/endpoints for the testnet opening
+├─ flop_status_feed.py           # hourly public status line (gated, off)
 ├─ contributions_log.py          # regenerates contributions-log.md from live data (proof-of-work)
 ├─ technocore_agent/             # thin public-API facade package (import technocore_agent)
 ├─ examples/                     # 01–06 runnable scripts, each self-documented
-├─ test_*.py                     # pytest suite (268 tests) — one file per module above
+├─ deploy/                       # optional VPS (systemd timer) runner
+├─ test_*.py                     # pytest suite — one file per module above
 └─ .github/workflows/
    ├─ agent_cron.yml             # every-5-min cron + state cache + run agent
    ├─ ci.yml                     # lint + pytest on push/PR

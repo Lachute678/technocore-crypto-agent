@@ -13,7 +13,8 @@ ngỏ liệu spend-to-unlock có ship và điểm quy đổi có sublinear (2× 
 volume-farm dựa trên giả định này; cơ chế thắng rõ hơn ở near-term là MINER, mà repo này không ở.
 
 Đây là SCAFFOLD (chưa có testnet FLOP). Phần thanh toán đi qua token_manager.spend() nên khi
-TESTNET_ENABLED=true + endpoint thật thì mỗi phiên đã chốt sẽ tự tích lũy mở khóa 3:1. Ở
+TESTNET_ENABLED=true + adapter thật thì mỗi phiên đã chốt được ghi vào số đã xác nhận (agent_cron
+hiện TỪ CHỐI backend này trên testnet, xem MEMPOOL_TESTNET_ALLOWED). Ở
 SIMULATION, một "thợ đào giả" trả PoUI giả để chạy trọn happy-path (build -> submit -> verify
 -> settle), nhưng chi mô phỏng KHÔNG tích lũy mở khóa (đúng: chỉ chi THẬT mới tính).
 
@@ -41,10 +42,8 @@ except Exception:  # pragma: no cover
 
 
 def vary_request(models, flops, max_latency_ms, fee=None, *, jitter_pct=0.0, rng=None):
-    """ĐA DẠNG HÓA tham số 1 phiên (chống 'manufactured activity' / pattern máy): chọn
-    model_hash NGẪU NHIÊN từ `models` (list — mỗi phiên khác nhau), và JITTER
-    flops/max_latency_ms/fee ±jitter_pct quanh giá trị nền. Spend đa dạng trông như DEMAND
-    THẬT thay vì N request giống hệt (mà census/anti-sybil chấm là boilerplate/low-originality).
+    """Tham số cho 1 phiên: chọn model_hash ngẫu nhiên từ `models` và lệch flops/max_latency_ms/fee
+    ±jitter_pct quanh giá trị nền, để nhiều phiên trong một lượt không gửi cùng một yêu cầu.
 
     Hàm THUẦN: tiêm `rng` để test tất định; không mạng, không side-effect. Trả
     (model_hash, flops, max_latency_ms, fee_str|None). `models` rỗng -> model_hash=None (caller
@@ -295,8 +294,7 @@ def verify_poui(request: dict, poui: dict, session_id: str = None) -> dict:
 
 def settle(request: dict, *, path: str = None, submit_tx=None,
            private_key=None, did: str = None, log=print) -> dict:
-    """THANH TOÁN phí phiên qua token_manager.spend() -> ở testnet, đây chính là 'inference
-    spend' tích lũy mở khóa 3:1. Trả nguyên outcome của spend() (spent_onchain /
+    """THANH TOÁN phí phiên qua token_manager.spend(). Trả nguyên outcome của spend() (spent_onchain /
     spent_simulated / skipped_* / error_submit)."""
     return tm.spend(request["fee"], f"inference-session:{request['id']}",
                     token=request.get("token"), path=path, submit_tx=submit_tx,
@@ -328,9 +326,9 @@ def run_inference_session(model_hash: str, max_latency_ms: int, flops: int,
     biết dừng ở đâu. SIMULATION chạy trọn happy-path bằng thợ đào giả; TESTNET cần submit_fn
     (đăng mempool) và submit_tx (thanh toán).
 
-    `deny_dids` = tập DID fleet nhà (main + fork). Nếu mempool match TRÚNG một miner trong đó
-    -> KHÔNG settle (trả 'skipped_fleet_miner'): luật FLOP 'independent demand only' không tính
-    chi cho miner cùng-nhóm + là cờ sybil. Chốt an toàn khi match tự nhiên lỡ rơi vào miner nhà."""
+    `deny_dids` = tập DID trong danh sách chặn (PROACTIVE_DENY_DIDS). Nếu mempool match TRÚNG một miner trong đó
+    -> KHÔNG settle (trả 'skipped_denied_miner'): luật FLOP 'independent demand only' không tính
+    chi cho miner cùng-nhóm + là cờ sybil. Chốt an toàn khi match tự nhiên lỡ rơi vào miner bị chặn."""
     req = build_request(model_hash, max_latency_ms, flops, security_flags, fee,
                         token=token, private_key=private_key, did=did)
     # Kiểm số dư TRƯỚC khi đăng: đăng rồi mới phát hiện thiếu tiền lúc settle = thợ đào đã
@@ -348,9 +346,9 @@ def run_inference_session(model_hash: str, max_latency_ms: int, flops: int,
     accept = sub["accept"]
     _miner = accept.get("miner_did")
     if deny_dids and _miner in set(deny_dids):
-        log(f"[session] match trúng miner FLEET {str(_miner)[:16]}… -> BỎ, KHÔNG settle "
+        log(f"[session] match trúng miner bị chặn {str(_miner)[:16]}… -> BỎ, KHÔNG settle "
             "(independent-demand-only, chống self-deal)")
-        return {"stage": "match", "outcome": "skipped_fleet_miner",
+        return {"stage": "match", "outcome": "skipped_denied_miner",
                 "request_id": req["id"], "miner_did": _miner}
     poui = accept.get("poui")
     if poui is None:
@@ -395,7 +393,7 @@ def _demo() -> None:
     print(f"unlock : spent_testnet={us['spent_testnet']} (đúng: sim không tích) · ratio 1/{us['ratio']}")
     print("\nTrung thực: sim dùng thợ đào giả + PoUI giả, verify chỉ kiểm liên kết. Chỉ "
           "TESTNET_ENABLED=true + FLOP_MEMPOOL_URL + submit_fn/submit_tx thật mới mua phiên "
-          "thật & tích lũy mở khóa 3:1.")
+          "thật.")
 
 
 if __name__ == "__main__":

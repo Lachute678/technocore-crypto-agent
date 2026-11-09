@@ -8,7 +8,7 @@ thiếu cờ/URL/seam thì trả skipped_* và không gửi gì (đúng ethos ph
 hiện thực theo scheme thật của họ (ký DID -> POST/GET faucet -> trả {"amount":..}).
 
 Cặp đôi với flop_pacer: faucet NẠP đều token vào ví, pacer CHI đều token ra 24/7 ->
-tối đa hóa "Tổng testnet đã chi" (tử số của công thức mở khóa mainnet 3:1) một cách
+tối đa hóa tổng testnet đã chi (thứ FLOP dùng để tính phân bổ, nếu được ghi cho ví mình) một cách
 hợp lệ, không dump.
 
 Env:
@@ -22,7 +22,8 @@ Env:
                             chu kỳ 24h tính chung mọi mức, lượt quick sẽ chặn lượt Verified).
   FLOP_FAUCET_PROVIDER      với linked: brightid | self — chứng minh người thật đã được NGƯỜI
                             gắn vào địa chỉ này. MetaMask/SIWE cần người ký mỗi lần -> agent từ chối.
-  FLOP_FAUCET_AMOUNT        lượng dự kiến mỗi claim (mặc định 100).
+  FLOP_FAUCET_AMOUNT        lượng dự kiến mỗi claim (mặc định 100) — chỉ gửi kèm yêu cầu, KHÔNG
+                            dùng để ghi sổ: faucet không báo số lượng thì sổ không ghi gì.
   FLOP_FAUCET_COOLDOWN_HOURS khoảng tối thiểu giữa 2 claim (mặc định 24). 'auto' = THĂM DÒ:
                             thử mỗi AUTO_PROBE_HOURS (1h); faucet trả thời điểm claim kế tiếp
                             (Retry-After / next_claim / retry_after) thì CHỜ đúng tới đó — tự
@@ -230,7 +231,8 @@ def run_faucet_cycle(claim_fn=None, token: str = None, now: int = None,
     """Một vòng faucet: kiểm cờ/cấu hình/cooldown/ngưỡng, rồi gọi `claim_fn` được tiêm
     để nhận token, và credit vào sổ cái. Mỗi nhánh là kết quả có ghi nhận, không ném lỗi:
       skipped_disabled / skipped_unconfigured / skipped_demand / skipped_cooldown /
-      skipped_full / skipped_daily_cap / error_claim / claimed.
+      skipped_full / skipped_daily_cap / error_claim / claimed_zero / claimed /
+      claimed_unknown_amount (faucet cấp mà không báo số lượng -> không ghi sổ).
     `claim_fn(req: dict) -> {"amount":..}` là seam THẬT (đợi spec FLOP), req gồm
     {token, amount, faucet_url, signed}."""
     token = (token or tm.default_token())
@@ -301,20 +303,27 @@ def run_faucet_cycle(claim_fn=None, token: str = None, now: int = None,
         return {"outcome": "error_claim",
                 "reason": f"claim faucet thất bại: {e} — thử lại sau ~{backoff // 60} phút"}
 
+    # Thiếu số lượng (None) KHÔNG còn được thay bằng FLOP_FAUCET_AMOUNT: đó là con số đoán (mặc định
+    # 100, mức quick thật là 25) -> sổ có FLOP không tồn tại. Vẫn tính là một lần claim, không ghi sổ.
     raw_amt = result.get("amount")
-    amt = str(faucet_amount() if raw_amt is None else raw_amt)
-    parsed = tm._parse_amount(amt)
+    amt = None if raw_amt is None else str(raw_amt)
+    parsed = None if amt is None else tm._parse_amount(amt)
     nxt = _learned_next(result, now)
-    if parsed is None or parsed <= 0:
+    if amt is not None and (parsed is None or parsed <= 0):
         # Faucet trả 0/rác: KHÔNG ghi sổ, KHÔNG tính là 1 lần claim (không đốt trần ngày).
-        # Vẫn đặt mốc thời gian để không gõ lại faucet mỗi 5 phút.
-        st.setdefault(token, {})["last_claim_ts"] = now
+        # Faucet HẸN giờ ("thử lại sau 120s") -> chờ ĐÚNG tới đó. Không được đặt last_claim_ts:
+        # lần bị từ chối không phải lần claim, và mốc đó cộng cooldown (1h auto / 24h) sẽ đè lên
+        # giờ hẹn -> vòng chờ-trong-run vô tác dụng, lỡ cả chu kỳ. Không hẹn -> vẫn đặt mốc để
+        # không gõ lại faucet mỗi 5 phút.
+        rec = st.setdefault(token, {})
         if nxt:
-            st[token]["next_claim_ts"] = nxt
+            rec["next_claim_ts"] = nxt
+        else:
+            rec["last_claim_ts"] = now
         _save(st, faucet_state)
         return {"outcome": "claimed_zero", "amount": "0",
                 "reason": f"faucet trả số lượng {raw_amt!r} — không ghi sổ"}
-    cr = tm.credit(amt, token=token, memo="faucet claim", path=ledger_path)
+    cr = tm.credit(amt, token=token, memo="faucet claim", path=ledger_path) if amt is not None else {}
     rec = st.setdefault(token, {})
     rec["last_claim_ts"] = now
     if nxt:
@@ -327,6 +336,10 @@ def run_faucet_cycle(claim_fn=None, token: str = None, now: int = None,
             claims_today = 0
     rec["claims"] = {day: claims_today + 1}
     _save(st, faucet_state)
+    if amt is None:
+        log(f"[faucet] claimed ? {token} testnet — faucet không báo số lượng, KHÔNG ghi sổ")
+        return {"outcome": "claimed_unknown_amount", "amount": None,
+                "reason": "faucet không báo số lượng — không ghi sổ, đối chiếu số dư trên chain"}
     log(f"[faucet] claimed {amt} {token} testnet -> số dư {cr.get('balance_after')}")
     return {"outcome": "claimed", "amount": amt, "balance_after": cr.get("balance_after"),
             "reason": "đã nhận FLOP testnet từ faucet"}

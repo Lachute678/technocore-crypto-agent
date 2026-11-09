@@ -196,10 +196,17 @@ def test_zero_amount_is_not_credited(paths, monkeypatch):
     assert r2["outcome"] == "skipped_cooldown"               # không gõ lại ngay
 
 
-def test_missing_amount_still_falls_back_to_requested(paths, monkeypatch):
+def test_missing_amount_is_a_claim_but_never_booked_at_the_requested_amount(paths, monkeypatch):
+    # Faucet quick thật cấp 25; FLOP_FAUCET_AMOUNT mặc định 100 -> trước đây sổ ghi 100 FLOP không có.
     _enable(monkeypatch)
+    monkeypatch.setenv("FLOP_FAUCET_MAX_PER_DAY", "3")
     r = ff.run_faucet_cycle(claim_fn=lambda req: {}, now=NOW, log=lambda m: None, **paths)
-    assert r["outcome"] == "claimed" and r["amount"] == ff.faucet_amount()
+    assert r["outcome"] == "claimed_unknown_amount" and r["amount"] is None
+    assert tm.check_balance(path=paths["ledger_path"]) == "0"
+    rec = ff._load(paths["faucet_state"])[tm.default_token()]
+    assert rec["last_claim_ts"] == NOW and sum(rec["claims"].values()) == 1      # vẫn là một lần claim
+    r2 = ff.run_faucet_cycle(claim_fn=CLAIM_OK, now=NOW + 60, log=lambda m: None, **paths)
+    assert r2["outcome"] == "skipped_cooldown"
 
 
 # --- chu kỳ 'auto': thử mỗi giờ, faucet báo lượt kế tiếp thì chờ đúng tới đó ---------------
@@ -233,6 +240,19 @@ def test_rate_limited_reply_waits_without_crediting(paths, monkeypatch):
     assert r["outcome"] == "claimed_zero" and tm.check_balance(path=paths["ledger_path"]) == "0"
     r2 = ff.run_faucet_cycle(claim_fn=CLAIM_OK, now=NOW + 3600 + 1, log=lambda m: None, **paths)
     assert r2["outcome"] == "skipped_cooldown"                      # chờ đủ 2h faucet yêu cầu
+
+
+@pytest.mark.parametrize("cooldown", ["auto", "24"])
+def test_not_yet_reply_honours_faucet_hint_not_cooldown(paths, monkeypatch, cooldown):
+    # Faucet bảo "thử lại sau 120s": phải chờ 120s, không phải 1h/24h cooldown tính từ lần bị từ chối.
+    _enable(monkeypatch)
+    monkeypatch.setenv("FLOP_FAUCET_COOLDOWN_HOURS", cooldown)
+    r = ff.run_faucet_cycle(claim_fn=lambda req: {"amount": 0, "retry_after_s": 120},
+                            now=NOW, log=lambda m: None, **paths)
+    assert r["outcome"] == "claimed_zero"
+    assert ff.seconds_until_next(now=NOW, faucet_state=paths["faucet_state"]) == 120
+    r2 = ff.run_faucet_cycle(claim_fn=CLAIM_OK, now=NOW + 121, log=lambda m: None, **paths)
+    assert r2["outcome"] == "claimed"
 
 
 def test_merge_state_never_moves_backwards():

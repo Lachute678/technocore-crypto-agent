@@ -644,6 +644,28 @@ def test_credit_hour_buckets_are_recorded(ledger):
     assert len(buckets) == 1 and list(buckets.values())[0] == ["105", 2]
 
 
+def test_gateway_spend_waits_for_onchain_attribution_before_unlock(ledger, monkeypatch):
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    tm.credit("100", path=ledger)
+    tm.record_gateway_spend("6", "inference-session gateway m1", "r-1", path=ledger)
+    tm.record_gateway_spend("3", "inference-session gateway m1", "r-2", path=ledger)
+    assert tm.unlock_status(path=ledger)["spent_testnet"] == "0"          # chưa xác nhận -> chưa mở khoá
+    assert tm.gateway_attribution(path=ledger)["unattributed"] == 9
+    assert tm.load_ledger(ledger)["entries"][-1]["attribution"] == "unverified"
+    assert tm.confirm_gateway_attribution("0", path=ledger)["outcome"] == "no_change"
+    assert tm.confirm_gateway_attribution("4", path=ledger)["amount"] == "4"   # chain ghi 4
+    assert tm.confirm_gateway_attribution("4", path=ledger)["outcome"] == "no_change"   # không cộng lại
+    tm.confirm_gateway_attribution("50", path=ledger)                    # chain > sổ -> kẹp ở phần chờ
+    a = tm.gateway_attribution(path=ledger)
+    assert a == {"unattributed": 0, "attributed": 9}
+    assert tm.unlock_status(path=ledger)["spent_testnet"] == "9"
+
+
+def test_confirm_attribution_is_a_noop_outside_testnet(ledger, monkeypatch):
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    assert tm.confirm_gateway_attribution("5", path=ledger)["outcome"] == "no_change"
+
+
 def test_gateway_spend_books_only_on_testnet_and_counts_as_a_session(ledger, monkeypatch):
     tm.credit("10", path=ledger)
     assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1",
@@ -652,11 +674,15 @@ def test_gateway_spend_books_only_on_testnet_and_counts_as_a_session(ledger, mon
     assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "", path=ledger)["outcome"] \
         == "skipped_insufficient"                                       # không bằng chứng -> không ghi
     r = tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1", path=ledger)
-    assert r["outcome"] == "spent_onchain"
+    assert r["outcome"] == "gateway_settled_unverified"
     led = tm.load_ledger(ledger)
-    assert led["session_cumulative"]["FLOP"] == "1.5" and led["entries"][-1]["via"] == "gateway"
-    assert tm.record_gateway_spend("50", "inference-session gateway m1", "chatcmpl-2",
-                                   path=ledger)["balance_after"] == "0"  # kẹp 0, không âm
+    e = led["entries"][-1]
+    assert e["via"] == "gateway" and e["ref"] == "chatcmpl-1" and "tx_hash" not in e   # không phải tx
+    assert "session_cumulative" not in led and led["gateway_unattributed"]["FLOP"] == "1.5"
+    assert led["balances"]["FLOP"] == "10"                 # quota gateway không rút từ ví
+    tm.confirm_gateway_attribution("1.5", path=ledger)
+    led = tm.load_ledger(ledger)
+    assert led["session_cumulative"]["FLOP"] == "1.5" and led["balances"]["FLOP"] == "8.5"
 
 
 def test_gateway_booking_is_idempotent_inside_the_ledger(ledger, monkeypatch):
@@ -664,8 +690,8 @@ def test_gateway_booking_is_idempotent_inside_the_ledger(ledger, monkeypatch):
     # cũ. Sổ cái phải tự chặn ghi lần hai (tổng chi chỉ tăng nên ghi trùng là VĨNH VIỄN).
     monkeypatch.setenv("TESTNET_ENABLED", "true")
     assert tm.record_gateway_spend("6.5", "inference-session gateway m1", "req-1", path=ledger)["outcome"] \
-        == "spent_onchain"
+        == "gateway_settled_unverified"
     assert tm.record_gateway_spend("6.5", "inference-session gateway m1", "req-1", path=ledger)["outcome"] \
         == "duplicate"
     led = tm.load_ledger(ledger)
-    assert led["session_cumulative"]["FLOP"] == "6.5" and len(led["gateway_refs"]) == 1
+    assert led["gateway_unattributed"]["FLOP"] == "6.5" and len(led["gateway_refs"]) == 1

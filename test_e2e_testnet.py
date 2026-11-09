@@ -4,7 +4,6 @@ Test từng hàm không bắt được lỗi ở CHỖ NỐI (thứ tự faucet 
 giữa các lượt, cảnh báo). Kịch bản: lượt 1 nhận faucet đúng ví DID + mua; lượt 2 biên nhận settle
 -> ghi sổ; lượt 3 không ghi trùng."""
 import json
-import pytest
 import agent_cron as ac
 import flop_gateway as gw
 import token_manager as tm
@@ -74,8 +73,8 @@ def test_three_testnet_runs_end_to_end(monkeypatch, tmp_path):
     assert len(faucet_posts) == 1 and faucet_posts[0][0].endswith("/fund")
     assert faucet_posts[0][1] == {"address": gw.wallet_address(ac.load_private_key())}
     assert g.get("network") == "testnet" and (g.get("stats") or {}).get("calls", 0) >= 1
-    assert float((led.get("session_cumulative") or {}).get("FLOP", 0)) > 0
+    assert not led.get("session_cumulative")                       # chain chưa xác nhận -> chưa tính
     assert "token_ledger_testnet" in kv
-    assert led["balances"]["FLOP"] == "18.5" and led["session_cumulative"]["FLOP"] == "6.5"   # 25 - 6.5
+    assert led["balances"]["FLOP"] == "25" and led["gateway_unattributed"]["FLOP"] == "6.5"
     assert (g.get("stats") or {}).get("receipts") == 1                   # settle ở lượt 2, không ghi trùng ở lượt 3
     assert sum("QUICK" in m for m in tg) == 1                             # cảnh báo mức quick đúng 1 lần

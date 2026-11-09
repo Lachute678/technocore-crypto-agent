@@ -69,18 +69,25 @@ def observe(state: dict, *, settled_onchain: int, status: str, spent_today_oncha
     w = dict(w) if isinstance(w, dict) else {}
     out = {"alert": None, "recovered": None}
     healthy_wait = str(status).endswith("pace-wait") and _num(spent_today_onchain) > 0
-    # Đường gateway (flop_gateway): "chưa tới nhịp" và "đã chi hết quota" là ĐÚNG THIẾT KẾ — với
-    # faucet 25 FLOP/ngày phần lớn các lượt là chờ. Trước đây status "…gateway/pace_wait" (gạch
-    # dưới) không khớp "pace-wait" -> mỗi lượt chờ bị đếm là "không chi" -> báo động GIẢ sau 6
-    # lượt, lặp mỗi 6h. Coi là TRUNG TÍNH: không đếm lỗi, cũng KHÔNG xoá đếm — nếu settlement hỏng
-    # thật, các lượt mua (chưa settle) xen giữa lượt chờ vẫn tích lại và báo động được.
-    if settled_onchain <= 0 and re.search(r"gateway/(pace_wait|exhausted)$", str(status)):
+    # Đường gateway (flop_gateway): "chưa tới nhịp" là ĐÚNG THIẾT KẾ — phần lớn các lượt là chờ.
+    # Trước đây status "…gateway/pace_wait" (gạch dưới) không khớp "pace-wait" -> mỗi lượt chờ bị
+    # đếm là "không chi" -> báo động GIẢ sau 6 lượt, lặp mỗi 6h. Coi là TRUNG TÍNH: không đếm lỗi,
+    # cũng KHÔNG xoá đếm — nếu settlement hỏng thật, các lượt mua (chưa settle) xen giữa lượt chờ
+    # vẫn tích lại và báo động được. daily_cap (phanh operator đặt) và attribution_hold (có Telegram
+    # riêng) cũng là trung tính. `exhausted` thì KHÔNG: OpenAPI /enroll/wallet ghi allowance "never
+    # renewed", nên hết quota = ngừng mua vĩnh viễn trên đường này — trước đây im lặng mãi.
+    # `overloaded` (gateway hết kênh với miner, flop-labs/network#31) và lượt nghỉ ngay sau nó cũng
+    # trung tính: lỗi phía FLOP, agent không sửa được, và sẽ tự mua lại khi gateway thông.
+    if settled_onchain <= 0 and (
+            re.search(r"gateway/(pace_wait|daily_cap|attribution_hold|overloaded|budget_spent)$", str(status))
+            or (str(status).endswith("gateway/backoff") and "overloaded" in str(reason).lower())):
         return out
     if settled_onchain > 0 or healthy_wait:
         if w.get("alerted_ts") and settled_onchain > 0:
             mins = max(0, int((now - int(_num(w.get("since", now)))) / 60))
-            out["recovered"] = (f"✅ TESTNET: agent đã CHI THẬT lại (spent_onchain) sau khoảng "
-                                f"{mins} phút gián đoạn.")
+            # Gateway settle chưa chứng minh chi tiêu đứng tên ví; dòng "đứng tên ví" mới nói điều đó.
+            out["recovered"] = (f"✅ TESTNET: agent đã có phiên settle lại sau khoảng {mins} phút gián "
+                                "đoạn (chưa phải bằng chứng chain đã ghi cho ví mình).")
         state[KEY] = {}
         return out
     w["misses"] = int(_num(w.get("misses"))) + 1
