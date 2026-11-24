@@ -76,7 +76,10 @@ jobs:
         run: |
           tg="OFF (chưa đặt secret nào)"
           if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || echo 000)
+            # curl lỗi mạng/timeout vẫn tự in 000 qua -w; `|| echo 000` cũ nối thêm thành "000000" ->
+            # rơi vào nhánh HTTP lạ và khuyên "sửa secret" sai (2026-11-08). Chỉ lấy 3 ký tự đầu.
+            code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)
+            code=$(printf '%.3s' "${code:-000}")
             case "$code" in
               200) tg="ON (token hợp lệ)" ;;
               000) tg="FAIL (không gọi được api.telegram.org)" ;;
@@ -99,6 +102,9 @@ jobs:
       - name: Run signed agent
         env:
           AGENT_PRIVATE_KEY: ${{ secrets.AGENT_PRIVATE_KEY }}
+          # Token CỦA LƯỢT CHẠY (quyền contents: read ở trên): chỉ gửi tới api.github.com, để radar issue/
+          # commit và job review không chia 60 request/giờ chung IP runner.
+          GITHUB_TOKEN: ${{ github.token }}
           STATE_FILE: state.json
           # Actions là runner DUY NHẤT (chạy chính mỗi 5'). Để 'backup' nếu sau này thêm
           # runner thứ 2 làm chính (xem cơ chế heartbeat trong agent_cron.py): khi đó Actions
@@ -154,6 +160,10 @@ jobs:
           FLOP_KIBBLE_DUP_SIM: ${{ vars.FLOP_KIBBLE_DUP_SIM }}
           # Vân tay chống-trùng hết hạn sau ngần này giờ (trống = 6). <=0 = không hết hạn.
           FLOP_KIBBLE_DUP_HOURS: ${{ vars.FLOP_KIBBLE_DUP_HOURS }}
+          # Trần ký tự ĐỀ BÀI (title + body) của job đưa vào model (trống = 4000, sàn 500).
+          FLOP_KIBBLE_TASK_MAX_CHARS: ${{ vars.FLOP_KIBBLE_TASK_MAX_CHARS }}
+          # Trần ký tự BÀI GIAO (deliverable) của một job kibble (trống = 1200).
+          FLOP_KIBBLE_MAX_CHARS: ${{ vars.FLOP_KIBBLE_MAX_CHARS }}
           # Báo cáo CHI TIÊU FLOP định kỳ qua Telegram (mặc định TẮT). Dùng lại 2 secret
           # Telegram của bước cảnh báo; agent chỉ ĐỌC chúng để gửi, không bao giờ log.
           FLOP_DAILY_REPORT_ENABLED: ${{ vars.FLOP_DAILY_REPORT_ENABLED }}
@@ -234,6 +244,9 @@ jobs:
           FLOP_TCLK_DRY_RUN: ${{ vars.FLOP_TCLK_DRY_RUN }}
           FLOP_TCLK_RAILS: ${{ vars.FLOP_TCLK_RAILS }}
           FLOP_TCLK_MAX_PER_RUN: ${{ vars.FLOP_TCLK_MAX_PER_RUN }}
+          # Bỏ offer có cửa sổ claim / khoảng tới refund ngắn hơn chừng này (ms; trống = 5 phút / mặc định code).
+          FLOP_TCLK_MIN_CLAIM_WINDOW_MS: ${{ vars.FLOP_TCLK_MIN_CLAIM_WINDOW_MS }}
+          FLOP_TCLK_MIN_REFUND_GAP_MS: ${{ vars.FLOP_TCLK_MIN_REFUND_GAP_MS }}
           # Vòng hoàn tất (gated riêng, dry-run mặc định). Chỉ tác dụng khi deal đã accept live
           # (FLOP_TCLK_DRY_RUN=off). Đặt FLOP_TCLK_COMPLETE_DRY_RUN=off mới thực sự reveal.
           FLOP_TCLK_COMPLETE_ENABLED: ${{ vars.FLOP_TCLK_COMPLETE_ENABLED }}
@@ -313,6 +326,8 @@ jobs:
           FLOP_RUN_BUDGET_SEC: ${{ vars.FLOP_RUN_BUDGET_SEC }}
           # Giá CỐ ĐỊNH mỗi lần gọi (FLOP) nếu FLOP công bố ngoài catalog; rỗng = đọc catalog.
           FLOP_GATEWAY_FIXED_PRICE: ${{ vars.FLOP_GATEWAY_FIXED_PRICE }}
+          # Gateway trừ lệch token × giá catalog quá N lần (mặc định 10; quota tụt: 100) -> DỪNG mua tới khi xử lý.
+          FLOP_GATEWAY_PRICE_RATIO_MAX: ${{ vars.FLOP_GATEWAY_PRICE_RATIO_MAX }}
           FLOP_GATEWAY_LAG_ALERT_HOURS: ${{ vars.FLOP_GATEWAY_LAG_ALERT_HOURS }}
           FLOP_GATEWAY_LAG_REALERT_HOURS: ${{ vars.FLOP_GATEWAY_LAG_REALERT_HOURS }}
           FLOP_GATEWAY_MIN_TOKENS: ${{ vars.FLOP_GATEWAY_MIN_TOKENS }}
@@ -328,6 +343,8 @@ jobs:
           # Trần chi tuyệt đối của gateway, FLOP (mặc định 100/lượt, 2500/ngày UTC; 0 = tắt).
           FLOP_GATEWAY_MAX_PER_RUN: ${{ vars.FLOP_GATEWAY_MAX_PER_RUN }}
           FLOP_GATEWAY_MAX_PER_DAY: ${{ vars.FLOP_GATEWAY_MAX_PER_DAY }}
+          # Trần CHUNG mỗi ngày UTC cho CẢ HAI đường mua (gateway + trực tiếp), FLOP. Trống = 2500; 0 = tắt.
+          FLOP_MAX_SPEND_PER_DAY: ${{ vars.FLOP_MAX_SPEND_PER_DAY }}
           # Ngân sách FLOP tối đa cho MỖI allowance gateway (mặc định trống = rải cả quota; quota LÀ FLOP,
           # devnet: tới 20.000 FLOP/24h do gateway cấp, không phải tiền ví). Trần ngày: MAX_PER_DAY.
           FLOP_GATEWAY_BUDGET_FLOP: ${{ vars.FLOP_GATEWAY_BUDGET_FLOP }}
@@ -337,6 +354,13 @@ jobs:
           # ngưỡng = ALERT_MIN). off = mua tiếp dù chưa xác nhận.
           FLOP_ATTRIB_GATE: ${{ vars.FLOP_ATTRIB_GATE }}
           FLOP_ATTRIB_GATE_MIN: ${{ vars.FLOP_ATTRIB_GATE_MIN }}
+          # Đang dừng mua vì chưa đứng tên: mỗi N giờ mua THĂM DÒ 1 lần nhỏ để tự mở lại khi chain
+          # ghi chi tiêu cho ví mình (mặc định 6; 0 = tắt thăm dò).
+          FLOP_ATTRIB_PROBE_HOURS: ${{ vars.FLOP_ATTRIB_PROBE_HOURS }}
+          # Mạng testnet mang tên riêng không có chữ "testnet" (vd aurora-1): đặt ĐÚNG tên /health trả.
+          FLOP_TESTNET_NETWORK_NAME: ${{ vars.FLOP_TESTNET_NETWORK_NAME }}
+          # Ghim genesis hash (0x…) của chain được phép chi; trống = không ghim.
+          FLOP_GATEWAY_GENESIS: ${{ vars.FLOP_GATEWAY_GENESIS }}
           # Trần FLOPs MỘT phiên (tùy chọn) — phiên to hơn tách thành nhiều phiên.
           FLOP_SESSION_MAX_FLOPS: ${{ vars.FLOP_SESSION_MAX_FLOPS }}
           # (testnet) Trần phiên chờ proof: đủ N thì ngừng đăng phiên mới (mặc định 3, 0 = tắt).
@@ -349,6 +373,59 @@ jobs:
           FLOP_TESTNET_RADAR: ${{ vars.FLOP_TESTNET_RADAR }}
           FLOP_TESTNET_RADAR_HOURS: ${{ vars.FLOP_TESTNET_RADAR_HOURS }}
           FLOP_RADAR_EXPLORER_URL: ${{ vars.FLOP_RADAR_EXPLORER_URL }}
+          # MUA TRỰC TIẾP từ một miner (flop_direct): kênh đứng tên CHÍNH ví agent. Mặc định TẮT. Chạy CLI
+          # chính thức của FLOP qua image ghim digest. Cần: miner SS58 + HTTPS endpoint + model của miner.
+          FLOP_DIRECT_ENABLED: ${{ vars.FLOP_DIRECT_ENABLED }}
+          FLOP_DIRECT_MINER: ${{ vars.FLOP_DIRECT_MINER }}
+          FLOP_DIRECT_ENDPOINT: ${{ vars.FLOP_DIRECT_ENDPOINT }}
+          # NHIỀU miner độc lập, xoay vòng (thay cho MINER/ENDPOINT): mỗi dòng (hoặc ';' / ',')
+          # `<SS58> <https endpoint> [model slug] [0x model hash]`.
+          FLOP_DIRECT_MINERS: ${{ vars.FLOP_DIRECT_MINERS }}
+          # Phiên tối đa mỗi lượt (mặc định 4; còn bị ngân sách thời gian của lượt chặn).
+          FLOP_DIRECT_MAX_PER_RUN: ${{ vars.FLOP_DIRECT_MAX_PER_RUN }}
+          # Kênh CLI báo đã settle mà explorer chưa ghi nhận: quá ngần này thì ngừng mở thêm (mặc định 20).
+          FLOP_DIRECT_MAX_PENDING: ${{ vars.FLOP_DIRECT_MAX_PENDING }}
+          FLOP_DIRECT_MODEL: ${{ vars.FLOP_DIRECT_MODEL }}
+          # Escrow = CHI PHÍ phiên. Trống -> ĐỊNH CỠ theo việc thật: giá model × GFLOP ước lượng (học từ kênh đã
+          # settle) cho vừa công suất miner × FLOP_DIRECT_SETTLE_TARGET_SEC, không thấp hơn minEscrow của offer,
+          # kẹp dưới FLOP_DIRECT_ESCROW_CAP (mặc định 100, trần cứng 200) và phần trần ngày còn lại.
+          # Đặt số -> escrow cố định.
+          FLOP_DIRECT_MAX_FLOP: ${{ vars.FLOP_DIRECT_MAX_FLOP }}
+          FLOP_DIRECT_ESCROW_CAP: ${{ vars.FLOP_DIRECT_ESCROW_CAP }}
+          # Offer quá đắt: minEscrow > MAX_OVERPAY lần chi phí việc ước lượng (mặc định 3; 0 = tắt) VÀ dư >=
+          # OVERPAY_MIN_FLOP (mặc định 1) -> không mua của miner đó (escrow là chi phí, settle hợp tác trả hết).
+          FLOP_DIRECT_MAX_OVERPAY: ${{ vars.FLOP_DIRECT_MAX_OVERPAY }}
+          FLOP_DIRECT_OVERPAY_MIN_FLOP: ${{ vars.FLOP_DIRECT_OVERPAY_MIN_FLOP }}
+          # Định cỡ phiên: thời gian chờ settle mục tiêu (mặc định 300s), biên escrow % (mặc định 20), giá
+          # FLOP/GFLOP ghi đè registry, công suất giả định khi chưa biết miner (mặc định 10 GFLOP/s).
+          FLOP_DIRECT_SETTLE_TARGET_SEC: ${{ vars.FLOP_DIRECT_SETTLE_TARGET_SEC }}
+          FLOP_DIRECT_MARGIN_PCT: ${{ vars.FLOP_DIRECT_MARGIN_PCT }}
+          FLOP_DIRECT_PRICE_PER_GN: ${{ vars.FLOP_DIRECT_PRICE_PER_GN }}
+          FLOP_DIRECT_DEFAULT_CAP_GFS: ${{ vars.FLOP_DIRECT_DEFAULT_CAP_GFS }}
+          # Miner có offer cho nhiều model: chỉ định hash model (0x…64). Không đoán model theo tên.
+          FLOP_DIRECT_MODEL_HASH: ${{ vars.FLOP_DIRECT_MODEL_HASH }}
+          FLOP_DIRECT_MAX_TOKENS: ${{ vars.FLOP_DIRECT_MAX_TOKENS }}
+          FLOP_DIRECT_MAX_PER_DAY: ${{ vars.FLOP_DIRECT_MAX_PER_DAY }}
+          # Trải đều trần ngày (mặc định bật): đến giờ h UTC chỉ cam kết tới trần × (h+1)/WINDOW_H (mặc định 20),
+          # lệch ±JITTER_PCT (mặc định 20). Cộng dồn: lượt lỗi thì lượt sau đuổi kịp. PACE=off -> chi dồn như cũ.
+          FLOP_DIRECT_PACE: ${{ vars.FLOP_DIRECT_PACE }}
+          # FLOP chừa lại cho phí giao dịch khi thu escrow theo số dư ví (mặc định 0.5).
+          FLOP_DIRECT_FEE_RESERVE: ${{ vars.FLOP_DIRECT_FEE_RESERVE }}
+          # Hạn riêng của bước mua trực tiếp (giây từ đầu lượt, mặc định 1020, trần 1080): phiên phải sống quá
+          # maxDuration của kênh để SDK tự thu hồi kênh hỏng.
+          FLOP_DIRECT_RUN_BUDGET_SEC: ${{ vars.FLOP_DIRECT_RUN_BUDGET_SEC }}
+          FLOP_DIRECT_PACE_WINDOW_H: ${{ vars.FLOP_DIRECT_PACE_WINDOW_H }}
+          FLOP_DIRECT_PACE_JITTER_PCT: ${{ vars.FLOP_DIRECT_PACE_JITTER_PCT }}
+          FLOP_DIRECT_TIMEOUT_SEC: ${{ vars.FLOP_DIRECT_TIMEOUT_SEC }}
+          # offer (mặc định) = chỉ dùng offer có chữ ký của miner. auto/force có thể mở kênh cưỡng bức (khoá
+          # FLOP tới hạn nếu miner không xác nhận) -> cần thêm FLOP_DIRECT_ALLOW_FORCE=on.
+          FLOP_DIRECT_VIA: ${{ vars.FLOP_DIRECT_VIA }}
+          FLOP_DIRECT_ALLOW_FORCE: ${{ vars.FLOP_DIRECT_ALLOW_FORCE }}
+          FLOP_DIRECT_DENY_MINERS: ${{ vars.FLOP_DIRECT_DENY_MINERS }}
+          # Image CLI ghi đè: BẮT BUỘC ghim digest (…@sha256:<64 hex>) — container nhận khoá ví.
+          FLOP_DIRECT_IMAGE: ${{ vars.FLOP_DIRECT_IMAGE }}
+          # Mạng của container CLI: bridge (mặc định) | host (như trước, chỉ khi CLI cần dịch vụ trên chính máy chạy).
+          FLOP_DIRECT_DOCKER_NETWORK: ${{ vars.FLOP_DIRECT_DOCKER_NETWORK }}
           # Bộ canh chi thật (testnet): báo Telegram sau N run liền không có phiên spent_onchain.
           FLOP_REAL_SPEND_ALERT_RUNS: ${{ vars.FLOP_REAL_SPEND_ALERT_RUNS }}
           FLOP_REAL_SPEND_REALERT_HOURS: ${{ vars.FLOP_REAL_SPEND_REALERT_HOURS }}
@@ -372,6 +449,8 @@ jobs:
           FLOP_FAUCET_REFILL_BELOW: ${{ vars.FLOP_FAUCET_REFILL_BELOW }}
           FLOP_FAUCET_DEMAND_ONLY: ${{ vars.FLOP_FAUCET_DEMAND_ONLY }}
           FLOP_FAUCET_MAX_PER_DAY: ${{ vars.FLOP_FAUCET_MAX_PER_DAY }}
+          # Một lần claim lớn hơn số này (FLOP, mặc định 100000) = phi lý (đơn vị raw?) -> KHÔNG ghi sổ, báo Telegram.
+          FLOP_FAUCET_MAX_CREDIT: ${{ vars.FLOP_FAUCET_MAX_CREDIT }}
           # Lượt faucet kế tiếp mở trong <= N giây thì chờ ngay trong run để claim đúng giờ (mặc định 300).
           FLOP_FAUCET_WAIT_MAX_SEC: ${{ vars.FLOP_FAUCET_WAIT_MAX_SEC }}
           FLOP_FAUCET_JITTER_MIN: ${{ vars.FLOP_FAUCET_JITTER_MIN }}

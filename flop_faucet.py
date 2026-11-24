@@ -66,6 +66,9 @@ def faucet_amount() -> str:
 
 
 AUTO_PROBE_HOURS = 1.0
+# Một lần claim lớn hơn số này là phi lý (mức cao nhất đã thấy: Verified 2000 FLOP): thường là số ở đơn vị raw (1e-18)
+# trong trường FLOP. Không ghi sổ — ghi vào là sổ có FLOP không tồn tại (ngân sách "auto" của pacer chi theo nó).
+DEFAULT_MAX_CREDIT = 100000.0
 # Claim LỖI (mạng, 4xx/5xx, thân báo lỗi) cũng phải lùi: không thì run 5 phút sau gõ lại ngay,
 # tức ~12 lần/giờ vào đúng lúc faucet đang từ chối.
 ERROR_BACKOFF_SEC = 3600
@@ -218,9 +221,11 @@ def _load(path: str = None) -> dict:
 
 
 def _save(state: dict, path: str = None) -> None:
+    p = state_path(path)
     try:
-        with open(state_path(path), "w", encoding="utf-8") as f:
+        with open(f"{p}.tmp", "w", encoding="utf-8") as f:     # file tạm rồi đổi tên: không để file dở
             json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(f"{p}.tmp", p)
     except Exception as e:
         print(f"[faucet] không lưu được state: {e}")
 
@@ -323,6 +328,27 @@ def run_faucet_cycle(claim_fn=None, token: str = None, now: int = None,
         _save(st, faucet_state)
         return {"outcome": "claimed_zero", "amount": "0",
                 "reason": f"faucet trả số lượng {raw_amt!r} — không ghi sổ"}
+    try:
+        max_credit = float(os.environ.get("FLOP_FAUCET_MAX_CREDIT", "").strip() or DEFAULT_MAX_CREDIT)
+    except ValueError:
+        max_credit = DEFAULT_MAX_CREDIT
+    if max_credit != max_credit or max_credit in (float("inf"), float("-inf")):
+        max_credit = DEFAULT_MAX_CREDIT                  # 'nan'/'inf' không được tắt chốt này
+    if parsed is not None and max_credit > 0 and parsed > max_credit:
+        rec = st.setdefault(token, {})
+        rec["last_claim_ts"] = now
+        if nxt:
+            rec["next_claim_ts"] = nxt
+        if cap is None:                                  # như nhánh thường: đếm cộng dồn cả khi chưa đặt trần
+            try:
+                claims_today = int(rec.get("claims", {}).get(day, 0))
+            except (TypeError, ValueError, AttributeError):
+                claims_today = 0
+        rec["claims"] = {day: claims_today + 1}
+        _save(st, faucet_state)
+        return {"outcome": "claimed_implausible", "amount": amt,
+                "reason": (f"faucet báo cấp {amt} {token} > trần hợp lý {max_credit:g} (FLOP_FAUCET_MAX_CREDIT) — có "
+                           "thể là đơn vị raw; KHÔNG ghi sổ, đối chiếu số dư trên chain")}
     cr = tm.credit(amt, token=token, memo="faucet claim", path=ledger_path) if amt is not None else {}
     rec = st.setdefault(token, {})
     rec["last_claim_ts"] = now

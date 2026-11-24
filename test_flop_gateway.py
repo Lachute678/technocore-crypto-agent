@@ -716,6 +716,16 @@ def test_report_line_summarises_pace_quota_and_receipts(monkeypatch):
     assert "lượt cuối: pace_wait" in line
 
 
+def test_report_line_hidden_when_gateway_stopped_running():
+    # Đợt tập devnet kết thúc 7/11 nhưng báo cáo ngày 9/11 vẫn in "đã chi 41.30/20000 … lượt cuối: backoff"
+    # như thể gateway còn chạy.
+    g = {"last_run": NOW, "last_outcome": "backoff", "network": "devnet", "remaining": 19958.7,
+         "stats": {"receipts": 18, "settled": 41.3}}
+    assert gw.report_line(g, NOW + 25 * 3600) is not None                 # còn trong chu kỳ báo cáo
+    assert gw.report_line(g, NOW + 2 * 86400) is None                      # gateway đã tắt: không in số cũ
+    assert gw.report_line({**g, "last_run": "rác"}, NOW) is None
+
+
 def test_retired_model_triggers_re_enrollment_instead_of_a_permanent_stall():
     fake, state = FakeGateway(expires_ms=SOON), {}
     _run(state, fake)                                                     # đăng ký, model m1
@@ -1395,3 +1405,155 @@ def test_replayed_answer_is_counted_once_in_the_day(monkeypatch):
     fake, state = _hung(monkeypatch)
     r = _step(state, fake, NOW + 1000, answer_fn=lambda p, t, c: None)
     assert r["outcome"] == "replayed" and _day(state) == pytest.approx(fake.cost)   # trước: max_cost + cost
+
+
+def test_lag_alert_is_silent_while_the_attribution_gate_holds():
+    """Cổng đứng tên đang dừng mua đã có tin riêng ("⛔ Đã DỪNG mua compute"): không gửi thêm "chi tụt lại"."""
+    g = {"window": {"total": 100.0, "spent": 0.0, "start": NOW, "horizon": NOW + 24 * 3600}}
+    kw = dict(pct=10, alert_hours=3, realert_hours=6)
+    for h in range(0, 8):
+        line, alert, _ = gw.lag_status(g, NOW + h * 3600, "attribution_hold", **kw)
+        assert alert is None
+    assert line and "attribution_hold" in line                    # dòng log vẫn in
+    line, alert, _ = gw.lag_status(g, NOW + 20 * 3600, "rate_limited", **kw)
+    assert alert is None                                           # lý do chính vẫn là attribution_hold
+    g2 = {"window": {"total": 100.0, "spent": 0.0, "start": NOW, "horizon": NOW + 24 * 3600}}
+    alerts = [gw.lag_status(g2, NOW + h * 3600, "rate_limited", **kw)[1] for h in range(0, 8)]
+    assert any(alerts)                                             # lý do khác vẫn báo như cũ
+
+
+# --- trần CHUNG mỗi ngày của cả hai đường mua (spend_room) -------------------------------------------------------------
+
+def _chats(fake):
+    return [p for p in fake.paths() if p == "/v1/chat/completions"]
+
+
+def test_combined_room_limits_what_the_gateway_spends():
+    base = FakeGateway(expires_ms=SOON)
+    assert _run({}, base)["calls"] == 2                            # không có trần chung: 2 lần gọi (1.8 FLOP)
+    fake = FakeGateway(expires_ms=SOON)
+    r = _run({}, fake, spend_room=lambda: 1.0)
+    assert r["outcome"] == "spent" and len(_chats(fake)) == 1 and r["spent"] <= 1.0
+
+
+@pytest.mark.parametrize("room", [0.0, -3.0])
+def test_exhausted_combined_room_stops_the_gateway(room):
+    fake = FakeGateway(expires_ms=SOON)
+    r = _run({}, fake, spend_room=lambda: room)
+    assert r["outcome"] == "daily_cap" and "FLOP_MAX_SPEND_PER_DAY" in r["reason"] and _chats(fake) == []
+
+
+def test_a_failing_combined_room_is_treated_as_no_room():
+    def boom():
+        raise RuntimeError("x")
+    fake = FakeGateway(expires_ms=SOON)
+    assert _run({}, fake, spend_room=boom)["outcome"] == "daily_cap" and _chats(fake) == []
+
+
+def test_nan_daily_cap_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_PER_DAY", "nan")
+    day = time.strftime("%Y-%m-%d", time.gmtime(NOW))
+    fake = FakeGateway(expires_ms=SOON)
+    r = _run({gw.KEY: {"profile": gw.profile_of("devnet"),
+                       "day_spent": {"day": day, "spent": gw.DEFAULT_MAX_PER_DAY + 1}}}, fake)
+    assert r["outcome"] == "daily_cap" and _chats(fake) == []      # trước: nan tắt trần, vẫn mua
+
+
+# --- M8: trần gửi kèm không vượt phần chia cho lần gọi --------------------------------------------------------------
+
+def test_max_cost_never_exceeds_the_share_of_the_due_amount():
+    fake = FakeGateway(expires_ms=SOON)
+    _run({}, fake, spend_room=lambda: 0.6)                         # phần đến hạn 0.6 -> một lần gọi tối đa 0.6
+    bodies = [c[3] for c in fake.calls if c[1] == "/v1/chat/completions"]
+    assert bodies and all(b["max_cost_flop"] <= 0.6 + 1e-9 for b in bodies)
+
+
+# --- M9: gateway trừ lệch xa token × giá -> dừng mua, giữ tới khi operator xử lý --------------------------------------
+
+def test_price_unit_mismatch_stops_buying_until_the_operator_acts(monkeypatch):
+    fake = FakeGateway(expires_ms=SOON, quota=1000.0, cost=50.0)    # cost_flop 50, token × giá 0.72 -> ~69 lần
+    st = {}
+    r = _run(st, fake)
+    assert r["outcome"] == "price_mismatch" and r["calls"] == 1 and "FLOP_GATEWAY_PRICE_RATIO_MAX" in r["reason"]
+    n = len(_chats(fake))
+    r = _run(st, fake)
+    assert r["outcome"] == "price_mismatch" and len(_chats(fake)) == n           # giữ chốt: không gọi nữa
+    monkeypatch.setenv("FLOP_GATEWAY_PRICE_RATIO_MAX", "100")
+    r = _run(st, fake)
+    assert r["outcome"] == "spent" and "price_mismatch" not in st[gw.KEY]
+
+
+def test_quota_derived_cost_uses_the_wider_band():
+    assert gw.price_ratio_ok(14, "quota") and not gw.price_ratio_ok(14, "usage")
+    assert not gw.price_ratio_ok(1000, "quota") and not gw.price_ratio_ok(0.001, "usage")
+
+
+# --- M2: trả phí mà không có câu trả lời ----------------------------------------------------------------------------
+
+def test_repeated_empty_answers_stop_buying(monkeypatch):
+    fake = FakeGateway(expires_ms=SOON)
+    fake.override[("POST", "/v1/chat/completions")] = Resp(data={
+        "id": "x", "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 0, "cost_flop": 0.9}})
+    st = {}
+    r = _run(st, fake)
+    assert r["outcome"] == "spent" and r["empty_answers"] == 2 and st[gw.KEY]["empty_streak"] == 2
+    r = gw.run_step(st, agent_key=_key("22"), http=fake, now=NOW + 300, prompts=["q1", "q2", "q3"],
+                    expect_network="devnet", sleep=lambda s: None, log=lambda *a: None)
+    assert r["outcome"] == "empty_answer" and st[gw.KEY]["wait_why"] == "empty_answers"
+
+
+# --- ngân sách operator (FLOP_GATEWAY_BUDGET_FLOP) khi lần gọi KHÔNG RÕ kết quả --------------------------------------
+
+def _budget_spent(state):
+    return state[gw.KEY]["flop_budget"]["spent"]
+
+
+def test_transport_timeout_charges_the_operator_budget_with_the_reserve(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_CALLS_PER_RUN", "1")
+    fake, state = FakeGateway(quota=25.0, expires_ms=LATER), {}
+    r = _step(state, _timeout_after_processing(fake), NOW)
+    assert r["outcome"] == "unknown_outcome"
+    assert _budget_spent(state) == pytest.approx(state[gw.KEY]["inflight"]["max_cost"])   # chưa rõ: tính mức tối đa
+    assert _budget_spent(state) > 0
+
+
+def test_ambiguous_524_charges_the_operator_budget_with_the_reserve(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_CALLS_PER_RUN", "1")
+    fake, state = FakeGateway(quota=25.0, expires_ms=LATER), {}
+    fake.override[("POST", "/v1/chat/completions")] = Resp(524, {"error": "origin_timeout"})
+    r = _step(state, fake, NOW)
+    assert r["outcome"] == "unknown_outcome"
+    assert _budget_spent(state) == pytest.approx(state[gw.KEY]["inflight"]["max_cost"])
+    assert _budget_spent(state) > 0
+
+
+def test_replayed_answer_is_charged_once_to_the_operator_budget(monkeypatch):
+    """Lần gọi không rõ kết quả đã tạm trừ `max_cost` vào ngân sách operator; phát lại lấy được phản hồi thì
+    THAY khoản tạm bằng chi phí thật, không cộng thêm (giống sổ ngày)."""
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    fake, state = _hung(monkeypatch)
+    held = state[gw.KEY]["inflight"]["max_cost"]
+    assert _budget_spent(state) == pytest.approx(held)                   # tạm trừ mức tối đa
+    r = _step(state, fake, NOW + 1000, answer_fn=lambda p, t, c: None)
+    assert r["outcome"] == "replayed"
+    assert _budget_spent(state) == pytest.approx(fake.cost)              # trước: max_cost + cost
+
+
+def test_day_counter_is_raised_to_todays_receipts_after_a_stale_restore(monkeypatch):
+    """Ghi KV lỗi rồi cache cũ: bộ đếm ngày quên phần gateway đã chi hôm nay, mà chi gateway không hiện trên chain của
+    ví (broker). Biên nhận của chính gateway là sàn (fuzz seed 298: trần chung bị vượt). Chỉ nâng, không hạ."""
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_CALLS_PER_RUN", "1")
+    fake, state = FakeGateway(quota=25.0, expires_ms=LATER), {}
+    assert _step(state, fake, NOW)["outcome"] == "spent"
+    paid = _day(state)
+    assert paid > 0
+    state[gw.KEY]["day_spent"] = {"day": state[gw.KEY]["day_spent"]["day"], "spent": 0.0}   # state cũ quên
+    monkeypatch.setenv("FLOP_GATEWAY_SKIP_PCT", "100")                  # lượt này không gọi thêm: chỉ đọc biên nhận
+    _step(state, fake, NOW + 600)
+    assert _day(state) == pytest.approx(paid)
+    state[gw.KEY]["day_spent"]["spent"] = paid + 50.0                   # bộ đếm cao hơn biên nhận: giữ nguyên
+    _step(state, fake, NOW + 1200)
+    assert _day(state) == pytest.approx(paid + 50.0)

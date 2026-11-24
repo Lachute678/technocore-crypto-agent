@@ -8,6 +8,168 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Direct buying pinned the FLOP CLI image `cli:v0.1.321` (SDK 0.5.2), which the current devnet runtime (spec
+  1014020 and later) rejects (flop-labs/network#238); every `session run` would have failed. The default is now
+  `cli:v0.1.418@sha256:fd97fab2…`, the image that `flop.network/releases.json` currently publishes (SDK 0.7.2).
+  The bundled CLI of both images was compared: every command, option and JSON field the agent uses is
+  unchanged. The new image only adds optional `diagnostics` and funding fields on errors.
+- Double fault (a failed KV write, then an Actions cache restored from an older run), found by adding KV write
+  failures, stale cache restores and gateway timeout/524/429 to the fuzz test. Before the fix, it caused three
+  problems when gateway and direct buying both ran:
+  - **Wrongly confirmed gateway spend:** the direct channel opened in the lost run fell out of tracking. Its
+    on-chain spend was then confirmed as gateway spend credited to our wallet, which opened the attribution
+    gate wrongly. With direct buying active, total-based confirmation now needs at least one gateway channel
+    seen under our wallet. Chain-reset detection still runs.
+  - **Daily cap overspent:** today's direct-escrow counter was forgotten and spent again (118.8 FLOP under a cap
+    of 60). The counter is now raised to the escrow of our own channels opened today on the explorer
+    (refunded channels excluded); it is only ever raised.
+  - **Channel never booked:** the lost channel was never booked. A sweep, at most every 30 minutes, puts own
+    channels back into the pending list. It takes only channels opened at or after the last session the state
+    knows about, from a miner the agent has bought from directly, and not refunded. The ledger's dedupe stops a
+    double booking. The sweep also re-tracks channels marked done but missing from the ledger (on testnet,
+    through the new `token_manager.direct_booked`), for the case where the ledger rolled back while the direct
+    state did not.
+  - **Gateway day counter:** a gateway day counter rolled back the same way is now raised to today's gateway
+    receipts (settled amount, or the reservation while a receipt is pending), because gateway spend does not
+    appear on our wallet's chain record.
+- Combined daily cap (`FLOP_MAX_SPEND_PER_DAY`) after an Actions cache loss: the gateway step runs before the direct
+  step, but only the direct step restored today's direct-escrow counter from KV. So in the first run after a cache
+  loss, the gateway computed its room as if no direct escrow had been committed today. The fuzz test found a day
+  at 32.4 FLOP against a cap of 30. The gateway step now restores the direct state from KV first when direct
+  buying is on. The fuzz test now also checks both daily caps, through mid-day cache losses, and models the
+  KV 8192-character limit.
+- Token ledger persistence: if the ledger was still over the 8192-character KV limit after dropping every
+  entry, `persist_ledger_to_kv` returned before it saved the `state.json` snapshot. Both durable copies then
+  stopped updating, so the ledger rolled back every run, including its receipt dedupe hashes. A full testnet
+  ledger (100 gateway + 100 direct hashes) is about 94% of the limit, so little growth would trigger this. Now:
+  - the snapshot is always saved first, in full;
+  - the KV copy trims `gateway_refs` to 40, then 20, before giving up (`/keys/me/receipts` returns the last 20);
+  - hydrate unions both hash lists from every valid copy, so a trimmed KV copy never loses a hash.
+- Gateway operator budget (`FLOP_GATEWAY_BUDGET_FLOP`): a call with an unknown outcome reserves `max_cost`
+  against the budget. When a later replay (`FLOP_GATEWAY_REPLAY_MAX`) recovered the answer, the real cost was
+  added on top of that reserve instead of replacing it, so the budget over-counted and buying stopped early.
+  The reserve is now recorded on the held request and replaced by the real cost. This is the same rule the
+  daily tally already followed. Neither variable is set in production, so the live agent was not affected.
+- `FLOP_KIBBLE_MAX_CHARS`, `FLOP_TCLK_MIN_CLAIM_WINDOW_MS` and `FLOP_TCLK_MIN_REFUND_GAP_MS` are documented
+  in the README as Repo Variables but were not passed by the agent workflow, so setting them had no effect.
+  They are now mapped. A test now requires every FLOP_/TESTNET_ variable that the README lists and the code
+  reads to be mapped, except the documented exceptions. All 34 variables in the day-one testnet checklist
+  were already mapped.
+- The public `kibble-score` no longer counts ATTEST votes that judged other workers' deliveries. The tracker
+  scored against the buffer fetched before the agent delivered, so every vote in it had been posted
+  earlier and was about someone else's work. Votes posted before the delivery time are now ignored by both
+  counters, and the delivery time is now taken after the DELIVER is posted. Every job on the board now
+  has 2-4 deliverers (measured 2026-11-14), and 29/35 votes carry no `rh`. So for a job with other
+  deliverers, the clean counter accepts only votes whose `rh` matches the agent's own delivery. Lifetime
+  totals before this change are inflated.
+- Security: the release workflow pins `pypa/gh-action-pypi-publish` v1.14.3 instead of v1.14.2
+  (GHSA-5xjx-3w67-w9x9). The older action bundled a `certifi` that still trusted the compromised emSign
+  root, the same issue as above. That affects the Sigstore/Trusted Publishing traffic of a job holding
+  `id-token: write`. The workflow runs only when a version tag is pushed.
+- Security: `certifi` 2026.7.22 -> 2026.10.23 in `requirements.lock` and `requirements-dev.lock`
+  (GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320, rated critical). Versions before 2026.10.18 trust the
+  `emSign ECC Root CA - G3` root, and eight intermediate CAs under it have compromised private keys. An
+  on-path attacker holding one could intercept or alter the agent's HTTPS traffic. Every request goes
+  through `requests` with this bundle: technocore.chat, the FLOP gateway bearer, Telegram and LLM API
+  keys. The new release is 22 days old, which follows the lock's at-least-two-weeks rule.
+- The 6-hourly KV check while direct buying is off no longer sends a "restored from an old KV copy" alert
+  when the copy has nothing left to reconcile. Before, an old finished copy would have been restored, then
+  dropped, and the stale alert repeated every 6 hours. The copy is now restored, and the alert sent, only
+  when it still has pending channels, an orphan search or an unfinished session.
+- With direct buying off, pending channels and an unfinished-session mark are still reconciled. If
+  `state.json` has no direct state (for example, the Actions cache was just lost), the signed KV copy is
+  read, at most once every 6 hours, and is reconciled when it still has pending channels, an orphan
+  search or an unfinished session. Before, nothing was checked until direct buying was turned back on. A
+  local unfinished-session mark alone also used to be skipped while buying was off.
+- Direct purchase now moves to the next prompt after every session the CLI ran, including one with an
+  unknown outcome. Before, it rotated only on success, so the next session sent the same prompt again and
+  repeated its `prompt_hash` on chain.
+- Force-settled channels are finalized even when direct buying is turned off, misconfigured, or every
+  miner is refused. Before, those checks returned first, so the escrow stayed locked and the spend was never
+  counted.
+- A channel is booked only when the explorer reports both `agent` and `observationHead: finalized`. A
+  missing `agent` used to count as the agent's own wallet, and a missing `observationHead` as finalized.
+  The real explorer always sends both fields (checked on devnet).
+- `did:key` entries in `PROACTIVE_DENY_DIDS` now block that DID's SS58 wallet for direct buying. Before,
+  they were dropped, so a sibling fork running a miner from its DID wallet was not blocked.
+- A faucet claim above `FLOP_FAUCET_MAX_CREDIT` (default 100000 FLOP) is not credited and sends a Telegram
+  alert. Such an amount is usually raw units in the FLOP field.
+- The x402 value rail checks that the escrow locks at least the deal amount (fail-closed). Before, a lock
+  of any size passed the gate.
+- tclk HTLC preimages are encrypted in `state.json` (AES-GCM, key derived from the agent key), and
+  plaintext entries are migrated on the next run. The Actions cache can be restored by pull-request
+  workflows on a public repository.
+- Removed an unused import and redundant assignments.
+- The CLI that receives the wallet key is better isolated. A `FLOP_DIRECT_IMAGE` override must now be pinned
+  by digest, or direct buying stops with a configuration error; an unpinned value is never passed to
+  Docker. The container runs on the `bridge` network instead of `host` (`FLOP_DIRECT_DOCKER_NETWORK=host`
+  restores it). The CLI process, Docker or `FLOP_DIRECT_CLI`, gets only basic system variables plus what
+  it needs. Before, a local CLI inherited the agent's whole environment: `AGENT_PRIVATE_KEY`, LLM API
+  keys, Telegram and GitHub tokens.
+- Signed KV records are bound to their namespace and key, plus the time they were sealed. Before, a record
+  only signed its body, so any valid record of this agent could be copied to another key (the KV is
+  world-writable) and still pass. Body-only records are read until 2026-11-21 so the first run after the
+  upgrade can hydrate. When direct state has to be restored from a KV copy sealed more than 6 hours ago,
+  a Telegram alert is sent.
+- The gateway's `max_cost_flop` no longer exceeds the share of the due amount for the call. The 10%
+  headroom used to be applied after the cap, so it could overrun the run, daily, combined and attribution
+  caps by up to 10%.
+- The gateway stops buying when its charge differs from usage tokens × the catalog price by more than
+  `FLOP_GATEWAY_PRICE_RATIO_MAX` (10×, or 100× when the charge is inferred from the quota drop). Before,
+  the ratio was only logged, so a misread price unit (such as per 1K tokens) would have mis-sized every call.
+  The stop persists until the operator acts, with one Telegram alert per day.
+- A paid call with no answer is now detected. After three in a row the gateway pauses for an hour, and
+  direct purchase pauses that miner for 6 hours (0 completion tokens, or an empty `reply`). Both send an
+  alert.
+- The attribution gate needs per-channel evidence. A probe purchase reopens the gate (and writes off old
+  pending gateway spend) only when the explorer shows a gateway channel settled in the agent's own name
+  since the probe. Gateway spend is not confirmed from chain totals while the latest gateway channel seen
+  belonged to someone else. Before, any untracked spend that raised the wallet's on-chain total could
+  reopen the gate.
+- A stale `state.json` no longer overrides a newer KV copy. When saving the Actions cache failed in run N,
+  run N+1 restored the cache of run N-1. Because that copy was not empty it won, and the channels, daily
+  reservation and in-flight session mark of run N were lost. The direct-purchase state now carries a
+  revision number that increases on every change and travels with both copies, and the newer one wins.
+  Pending channels that only the local copy has and that are not done yet are kept. The gateway's durable
+  blob (`gateway_inflight`) wins when its `at` is newer than the local state. The gateway's daily counter
+  always takes the higher figure for the same UTC day.
+- Direct purchase no longer buys from a miner whose offer `minEscrow` is far above the estimated cost of
+  the work. A cooperative settle pays the whole escrow, so a miner that raised its minimum close to the
+  escrow cap could sell a few dozen tokens at that price. The default limit is more than 3 times the
+  estimate and at least 1 FLOP above it (`FLOP_DIRECT_MAX_OVERPAY`, `FLOP_DIRECT_OVERPAY_MIN_FLOP`). One
+  Telegram alert is sent per miner. A session shrunk by the daily cap or the balance is not counted as
+  overpriced.
+- A single daily cap now covers both buying paths: `FLOP_MAX_SPEND_PER_DAY` (default 2500 FLOP, 0
+  disables), on top of each path's own cap. Before, the gateway (2500) and direct (2000 in the current
+  configuration) caps were separate, so a day could spend almost double what the operator thought the
+  cap was.
+- `nan` or `inf` in a numeric variable no longer disables a spending cap. Every comparison with `nan` is
+  false, so `FLOP_GATEWAY_MAX_PER_DAY=nan` used to let the gateway keep buying past its cap. Non-finite
+  values now fall back to the default.
+- Direct purchase saves its progress before every CLI session. A run killed mid-session (job timeout,
+  lost runner) used to lose the channels it had already opened, the escrow it had reserved against the
+  daily cap and any hint that a channel might be open. Now a `checkpoint` writes the in-flight session
+  mark, the daily reservation and the channels opened so far to `state.json` and the signed KV copy, and
+  writes again after each session. The next run treats a leftover mark as an unknown outcome: it holds
+  that escrow, blocks the miner for 6 hours and searches the explorer for the channel.
+- A CLI exit with an error code but no JSON (container killed with 137, a Node crash, empty stderr) is now
+  an unknown outcome. Before, it only backed off for an hour, so a channel opened before the crash was
+  never tracked or booked. A clear refusal (JSON `ok:false`, an unknown option, or Docker failing to
+  start the container with 125/126/127) still releases the daily reservation.
+- The orphan-channel search no longer re-adopts channels that were already booked. Each unknown-outcome
+  hold now records its miner and the window in which its session could have opened a channel. A channel
+  is adopted only if it falls inside a live hold's window and belongs to the same miner, and it consumes
+  that hold. Before, every wallet channel opened after the first cut was a candidate. Once a booked
+  channel had left the 50-entry `done` list, it came back as an orphan (a replay: 60 sessions after one
+  cut re-added 10 channels). Holds written before this change still match within 30 minutes of their run.
+- Direct channels have their own dedupe list (`direct_refs`, kept on KV) instead of sharing the 100
+  gateway receipt hashes. With both paths on, gateway receipts pushed direct hashes out within hours, and
+  a re-adopted channel was booked a second time (replay: +50 FLOP in the airdrop measure, epoch totals
+  and balance). Channel ids are compared case-insensitively, and hashes from older ledgers still count.
+- The Telegram health check in the agent workflow reports a network failure or timeout as "cannot
+  reach api.telegram.org" again. curl already prints `000` on such failures and the `|| echo 000`
+  fallback appended another one, so the code became `000000`, fell through to the unknown-status branch
+  and advised fixing the secret (seen once on 2026-11-08 while the token was valid).
 - The daily spend counter no longer keeps the full reserve of a request whose outcome was unknown
   (a timeout or HTTP 524). The reserve is still counted at once, so the daily cap cannot be overrun.
   Once the receipt is reconciled, the reserve is replaced by the settled amount, or by 0 if the request

@@ -110,8 +110,8 @@ def _c(i, role):
             "html_url": f"https://github.com/flop-labs/yellowpaper/issues/172#issuecomment-{i}"}
 
 
-def _run(st, f):
-    return rd.check(st, f, wallet=W, explorers=(DEV,))
+def _run(st, f, now=None):
+    return rd.check(st, f, wallet=W, explorers=(DEV,), now=now)
 
 
 def test_attribution_first_sight_is_quiet_and_community_comments_do_not_alert():
@@ -139,12 +139,88 @@ def test_issue_closed_alerts_once():
     assert _run(st, _attr(issue_state="closed")) is None
 
 
-def test_offers_and_wallet_spend_alert_on_zero_to_positive_only():
+H0 = 1_800_000_000
+HOUR = 3600
+
+
+def test_first_spend_alerts_now_later_increases_once_a_day():
+    st = {}
+    _run(st, _attr(), now=H0)
+    alert = _run(st, _attr(offers=3, spent="2500000000000000000"), now=H0 + HOUR)
+    assert "OFFER công khai (3)" in alert
+    assert "CHI THẬT ghi on-chain" in alert and "ví 5CFP21…QnUP" in alert
+    assert "+2.5 FLOP (tổng 2.5 FLOP)" in alert and "LẦN ĐẦU" in alert      # lần đầu: báo NGAY
+    assert "KHÔNG tính airdrop" in alert                                     # devnet ghi rõ
+    # Tăng tiếp trong ngày: KHÔNG báo từng giờ, gộp lại.
+    assert _run(st, _attr(offers=3, spent="5000000000000000000"), now=H0 + 2 * HOUR) is None
+    assert _run(st, _attr(offers=3, spent="9000000000000000000"), now=H0 + 12 * HOUR) is None
+    # Đủ ~24h kể từ lần báo trước: 1 tin gộp đủ phần tăng (6.5 = 9 - 2.5).
+    alert = _run(st, _attr(offers=3, spent="9000000000000000000"), now=H0 + 25 * HOUR)
+    assert "+6.5 FLOP (tổng 9 FLOP)" in alert and "24h qua" in alert and "LẦN ĐẦU" not in alert
+    # Ngày sau không chi thêm: im.
+    assert _run(st, _attr(offers=3, spent="9000000000000000000"), now=H0 + 50 * HOUR) is None
+
+
+def test_daily_digest_does_not_drift_with_hourly_reads():
+    # Lượt đọc ~mỗi 61 phút: tin ngày vẫn ra ở lượt đọc đầu tiên >= 23,5h, không trôi thêm 1 giờ mỗi ngày.
+    st = {}
+    _run(st, _attr(spent=str(10 ** 18)), now=H0)
+    assert _run(st, _attr(spent=str(2 * 10 ** 18)), now=H0 + 23 * HOUR) is None
+    assert "+1 FLOP (tổng 2 FLOP)" in _run(st, _attr(spent=str(2 * 10 ** 18)), now=H0 + 23 * HOUR + 1900)
+
+
+def test_onchain_spend_first_sight_counts_from_zero():
+    # Explorer testnet chỉ sống từ ngày testnet mở: lần đọc đầu đã có chi tiêu thì vẫn phải báo
+    # đủ từ 0, không được nuốt phần chi trước lần đọc đầu.
+    st = {}
+    alert = _run(st, _attr(spent="7000000000000000000"))
+    assert "+7 FLOP (tổng 7 FLOP)" in alert and "LẦN ĐẦU" in alert
+    assert st[rd.KEY]["attr_spent_notified"] == {"explorer.devnet.flop.network": 7 * 10 ** 18}
+    assert _run(st, _attr(spent="7000000000000000000")) is None
+
+
+def test_onchain_spend_explorer_unreachable_then_up_reports_everything():
+    st = {}
+    down = _attr()
+    _run(st, lambda u: None if "inference-spend" in u else down(u))          # explorer chưa có DNS
+    assert "attr_spent_notified" not in st[rd.KEY] or not st[rd.KEY]["attr_spent_notified"]
+    alert = _run(st, _attr(spent=str(3 * 10 ** 18)))
+    assert "+3 FLOP (tổng 3 FLOP)" in alert
+
+
+def test_onchain_spend_old_state_without_notified_uses_last_reading():
+    h = "explorer.devnet.flop.network"
     st = {}
     _run(st, _attr())
-    alert = _run(st, _attr(offers=3, spent="2500000000000000000"))
-    assert "OFFER công khai (3)" in alert and "VÍ MÌNH 5CFP21…QnUP" in alert and "2.5 FLOP" in alert
-    assert _run(st, _attr(offers=5, spent="9000000000000000000")) is None   # tăng tiếp: không lặp
+    st[rd.KEY]["attr_spent_raw"] = {h: 3 * 10 ** 18}                         # state trước bản này
+    st[rd.KEY].pop("attr_spent_notified")
+    assert _run(st, _attr(spent=str(4 * 10 ** 18)), now=H0) is None          # bắt đầu đếm ngày
+    alert = _run(st, _attr(spent=str(4 * 10 ** 18)), now=H0 + 24 * HOUR)
+    assert "+1 FLOP (tổng 4 FLOP)" in alert
+
+
+def test_onchain_spend_reset_counts_again_from_zero():
+    st = {}
+    _run(st, _attr(spent=str(5 * 10 ** 18)))
+    assert _run(st, _attr(spent="0")) is None                               # reset về 0: chưa chi gì
+    alert = _run(st, _attr(spent=str(10 ** 18)))
+    assert "+1 FLOP (tổng 1 FLOP)" in alert
+    alert = _run(st, _attr(spent=str(4 * 10 ** 17)))                         # reset và ĐÃ chi lại
+    assert "+0.4 FLOP (tổng 0.4 FLOP)" in alert and "mạng reset" in alert
+
+
+def test_reset_reports_old_network_unreported_part():
+    st = {}
+    _run(st, _attr(spent=str(5 * 10 ** 18)), now=H0)                         # báo ngay 5
+    assert _run(st, _attr(spent=str(8 * 10 ** 18)), now=H0 + HOUR) is None   # +3 chờ tin ngày
+    alert = _run(st, _attr(spent=str(2 * 10 ** 18)), now=H0 + 2 * HOUR)     # reset trước tin ngày
+    assert "+2 FLOP (tổng 2 FLOP)" in alert and "mạng reset" in alert
+    assert "mạng cũ còn +3 FLOP chưa báo" in alert
+
+
+def test_fmt_flop():
+    assert rd.fmt_flop(0) == "0" and rd.fmt_flop(25 * 10 ** 17) == "2.5"
+    assert rd.fmt_flop(123456789) != "0"                                     # số rất nhỏ vẫn hiện
 
 
 def test_attribution_sources_failing_are_ignored():

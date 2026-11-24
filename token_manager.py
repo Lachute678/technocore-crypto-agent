@@ -164,13 +164,22 @@ def load_ledger(path: str = None) -> dict:
     return data
 
 
-def _save_ledger(state: dict, path: str = None) -> None:
+def _atomic_json(p: str, state) -> None:
+    """Ghi JSON ra file tạm rồi đổi tên: run bị giết giữa chừng không để lại file dở (load coi là rỗng)."""
+    tmp = f"{p}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def _save_ledger(state: dict, path: str = None) -> bool:
     p = ledger_path(path)
     try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        _atomic_json(p, state)
+        return True
     except Exception as e:
-        print(f"[ledger] không lưu được {p}: {e}")
+        print(f"[ledger] ⚠️ không lưu được {p}: {e}")
+        return False
 
 
 def save_ledger(state: dict, path: str = None) -> None:
@@ -499,7 +508,9 @@ def spend(amount, memo, token: str = None, *, path: str = None,
         _accrue_day(state, token, amt)         # tổng theo ngày -> pacer không cần entries
         if is_session_spend(memo):             # thước đo airdrop THẬT
             _accrue_session(state, token, amt)
-        _save_ledger(state, path)
+        if not _save_ledger(state, path):
+            # Giao dịch ĐÃ lên chain, không hoàn được: báo to để đối soát tay theo tx hash.
+            log(f"[ledger] ⚠️ chi on-chain {_fmt(amt)} {token} (tx {tx_hash}) nhưng KHÔNG lưu được sổ — đối soát tay")
         short = (tx_hash or "")[:12]
         log(f"[ledger] spent {_fmt(amt)} {token} for {memo} (tx {short}…)")
         return {**base, "outcome": "spent_onchain", "balance_after": new_bal,
@@ -524,6 +535,31 @@ def spend(amount, memo, token: str = None, *, path: str = None,
 
 
 GATEWAY_REFS_KEEP = 100      # gateway trả tối đa ~20 biên nhận/lần -> 100 là dư
+# Kênh MUA TRỰC TIẾP đã ghi sổ: danh sách RIÊNG. Trước đây chung `gateway_refs` (100 mục) nên chạy cả hai đường thì
+# biên nhận gateway (tới 4 lần gọi/lượt) đẩy dấu của kênh trực tiếp ra sau vài giờ, và kênh bị nhặt lại (đối soát /
+# tìm kênh mồ côi) được ghi sổ LẦN HAI. Mục cũ trong `gateway_refs` vẫn được kiểm (sổ có từ trước bản này).
+DIRECT_REFS_KEEP = 100
+
+
+def _direct_ref_hashes(channel_id) -> tuple:
+    """(dấu để lưu, mọi dấu cần kiểm). Id kênh là hex: so không phân biệt hoa/thường (đường tìm kênh mồ côi hạ chữ,
+    CLI có thể không), vẫn kiểm cả dấu của chuỗi gốc cho sổ cũ."""
+    raw = str(channel_id).strip()
+
+    def h(c):
+        return hashlib.sha256(f"direct:{c}".encode("utf-8")).hexdigest()[:16]
+    return h(raw.lower()), {h(raw), h(raw.lower())}
+
+
+def direct_booked(channel_id, path: str = None) -> bool:
+    """Kênh mua trực tiếp này ĐÃ vào sổ chưa (theo direct_refs, kèm gateway_refs của sổ cũ)."""
+    if not channel_id:
+        return False
+    state = load_ledger(path)
+    _, check = _direct_ref_hashes(channel_id)
+    seen = {x for x in (state.get("direct_refs") or []) if isinstance(x, str)}
+    seen |= {x for x in (state.get("gateway_refs") or []) if isinstance(x, str)}
+    return bool(check & seen)
 
 
 def record_gateway_spend(amount, memo, ref: str, token: str = None, *, path: str = None,
@@ -565,9 +601,78 @@ def record_gateway_spend(amount, memo, ref: str, token: str = None, *, path: str
     _accrue_day(state, token, amt)
     gc = state.setdefault("gateway_count", {})
     gc[token] = int(gc.get(token, 0)) + 1
-    _save_ledger(state, path)
+    if not _save_ledger(state, path):
+        # flop_gateway đánh dấu biên nhận "đã thấy" theo kết quả này: báo thành công khi sổ không được ghi là
+        # mất hẳn khoản chi đó.
+        return {"outcome": "save_failed", "reason": "không ghi được sổ cái — để lượt sau ghi lại"}
     log(f"[ledger] gateway settled {_fmt(amt)} {token} for {memo} (ref {str(ref)[:12]}…, chain chưa xác nhận)")
     return {"outcome": "gateway_settled_unverified", "amount": _fmt(amt), "ref": ref}
+
+
+def record_direct_spend(amount, memo, channel_id: str, token: str = None, *, escrow=None, path: str = None,
+                        log=print) -> dict:
+    """Ghi sổ một phiên MUA TRỰC TIẾP đã settle (flop_direct): kênh compute đứng tên CHÍNH ví agent, explorer
+    finalized báo PAID. Chain đã xác nhận đứng tên ví mình, nên vào thẳng thước đo airdrop
+    (session_cumulative, spent_testnet) và trừ số dư — không qua phần "chờ xác nhận" như gateway.
+
+    Cộng cả vào `gateway_epoch_done` (phần chi on-chain của ví ĐÃ có trong sổ, theo kỳ chain): cổng đứng tên
+    của đường gateway coi "chain ghi cho ví nhiều hơn sổ" là chi gateway đã được xác nhận; thiếu bước này
+    thì chi trực tiếp sẽ bị dùng để xác nhận NHẦM khoản gateway đang chờ. Chỉ ở chế độ testnet; chống ghi
+    trùng theo id kênh (bền qua KV).
+
+    `amount` = minerPaid + burned (đúng số explorer cộng vào chi tiêu của ví — thước đo airdrop). `escrow` = số
+    ví THỰC MẤT: settle hợp tác trả hết escrow, 1% thành phí kiểm toán (computeChannel.AuditFeeEarmarked,
+    auditFeeSplitPpm = 10000) không về ví. Số dư trừ theo escrow, nếu không sổ cao hơn chain 1% mỗi phiên."""
+    token = (token or default_token())
+    amt = _parse_amount(amount)
+    if ledger_mode() != "testnet":
+        return {"outcome": "skipped_simulation", "reason": "chỉ ghi sổ chi trực tiếp khi TESTNET_ENABLED"}
+    if amt is None or amt <= 0 or not channel_id:
+        return {"outcome": "skipped_insufficient", "reason": f"thiếu số lượng/kênh ({amount!r}, {channel_id!r})"}
+    state = load_ledger(path)
+    h, check = _direct_ref_hashes(channel_id)
+    drefs = [x for x in (state.get("direct_refs") or []) if isinstance(x, str)]
+    legacy = {x for x in (state.get("gateway_refs") or []) if isinstance(x, str)}
+    if check & (set(drefs) | legacy):
+        return {"outcome": "duplicate", "reason": f"kênh {str(channel_id)[:18]} đã ghi sổ"}
+    state["direct_refs"] = (drefs + [h])[-DIRECT_REFS_KEEP:]
+    esc = _parse_amount(escrow) if escrow is not None else None
+    outflow = max(amt, esc) if esc is not None and esc > 0 else amt
+    cur = _parse_amount(state["balances"].get(token, "0")) or Decimal(0)
+    new_bal = _fmt(max(Decimal(0), cur - outflow))
+    state["balances"][token] = new_bal
+    entry = {
+        "kind": "spend", "token": token, "amount": _fmt(amt), "memo": memo, "mode": "testnet",
+        "balance_after": new_bal, "ref": str(channel_id)[:80], "via": "direct", "attribution": "onchain",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if outflow != amt:
+        entry["escrow"] = _fmt(outflow)
+    state["entries"].append(entry)
+    dc = state.setdefault("direct_count", {})
+    dc[token] = int(dc.get(token, 0)) + 1
+    _accrue_cumulative(state, token, amt)
+    _accrue_day(state, token, amt)
+    _accrue_session(state, token, amt)
+    _accrue_unlock(state, token, amt)
+    da = state.setdefault("direct_attributed", {})
+    da[token] = _fmt((_parse_amount(da.get(token, "0")) or Decimal(0)) + amt)
+    # Phần TRỰC TIẾP trong kỳ chain hiện tại: cổng đứng tên của gateway trừ nó khỏi số chain ghi cho ví (chain
+    # không tách được hai đường). Mở kỳ mới (mạng reset) thì về 0 cùng gateway_epoch_done.
+    de = state.setdefault("direct_epoch_done", {})
+    de[token] = _fmt((_parse_amount(de.get(token, "0")) or Decimal(0)) + amt)
+    # ... và phần ghi sổ KỂ TỪ lần đọc chain nhất quán gần nhất: nếu lần đọc sau hoá ra là chain đã reset (phát hiện
+    # trễ tới CHAIN_RESET_READINGS lượt khi không có genesis), các phiên này thuộc chain MỚI — chuyển sang kỳ mới.
+    dso = state.setdefault("direct_since_ok", {})
+    dso[token] = _fmt((_parse_amount(dso.get(token, "0")) or Decimal(0)) + amt)
+    ep_map = state.setdefault("gateway_epoch_done", {})
+    done = (state.get("gateway_attributed") or {}).get(token, "0")
+    ep_map[token] = _fmt((_parse_amount(ep_map.get(token, done)) or Decimal(0)) + amt)
+    if not _save_ledger(state, path):
+        # Báo thành công khi sổ KHÔNG được ghi thì flop_direct bỏ kênh khỏi danh sách chờ -> khoản chi mất hẳn.
+        return {"outcome": "save_failed", "reason": "không ghi được sổ cái — giữ kênh, thử lại lượt sau"}
+    log(f"[ledger] chi trực tiếp {_fmt(amt)} {token} đứng tên ví mình (kênh {str(channel_id)[:12]}…)")
+    return {"outcome": "direct_settled", "amount": _fmt(amt)}
 
 
 def gateway_attribution(token: str = None, path: str = None) -> dict:
@@ -578,23 +683,149 @@ def gateway_attribution(token: str = None, path: str = None) -> dict:
             for k in ("unattributed", "attributed")}
 
 
+def gateway_chain_high(token: str = None, path: str = None) -> Decimal:
+    """Tổng chi on-chain CAO NHẤT của ví đã thấy trong kỳ hiện tại của chain (0 nếu chưa có), không phụ
+    thuộc số đọc explorer còn mới hay không."""
+    token = (token or default_token())
+    state = load_ledger(path)
+    hw = _parse_amount((state.get("gateway_chain_hw") or {}).get(token, "0")) or Decimal(0)
+    ep = _parse_amount((state.get("gateway_epoch_done") or {}).get(token, "0")) or Decimal(0)
+    return max(hw, ep)
+
+
+def direct_epoch_done(token: str = None, path: str = None) -> Decimal:
+    """Chi MUA TRỰC TIẾP đã ghi sổ trong kỳ chain hiện tại (nằm trong gateway_epoch_done)."""
+    token = (token or default_token())
+    return _parse_amount((load_ledger(path).get("direct_epoch_done") or {}).get(token, "0")) or Decimal(0)
+
+
+def gateway_epoch_done(token: str = None, path: str = None) -> Decimal:
+    """Phần chi gateway đã được chain xác nhận trong KỲ hiện tại của chain (xem confirm_gateway_attribution)."""
+    token = (token or default_token())
+    state = load_ledger(path)
+    done = (state.get("gateway_attributed") or {}).get(token, "0")
+    return _parse_amount((state.get("gateway_epoch_done") or {}).get(token, done)) or Decimal(0)
+
+
+def write_off_gateway_pending(max_amount=None, token: str = None, *, path: str = None, log=print) -> Decimal:
+    """Chuyển tối đa `max_amount` (None = tất cả) từ chi gateway CHỜ xác nhận sang `gateway_written_off`:
+    khoản đã chi qua kênh KHÔNG đứng tên ví mình, chain sẽ không bao giờ ghi cho mình. Để trong phần chờ
+    thì cổng đứng tên dừng mua mãi dù các lần mua mới đã đứng tên đúng. Không vào thước đo airdrop, không
+    đổi số dư, không đổi tổng chi cộng dồn. Trả số đã chuyển."""
+    token = (token or default_token())
+    if ledger_mode() != "testnet":
+        return Decimal(0)
+    state = load_ledger(path)
+    pend_map = state.setdefault("gateway_unattributed", {})
+    pend = _parse_amount(pend_map.get(token, "0")) or Decimal(0)
+    cap = pend if max_amount is None else (_parse_amount(max_amount) or Decimal(0))
+    amt = max(Decimal(0), min(pend, cap))
+    if amt <= 0:
+        return Decimal(0)
+    off = state.setdefault("gateway_written_off", {})
+    off[token] = _fmt((_parse_amount(off.get(token, "0")) or Decimal(0)) + amt)
+    pend_map[token] = _fmt(pend - amt)
+    _save_ledger(state, path)
+    log(f"[ledger] chuyển {_fmt(amt)} {token} chi gateway chờ xác nhận sang KHÔNG TÍNH (kênh không đứng tên ví mình)")
+    return amt
+
+
+CHAIN_RESET_READINGS = 3     # KHÔNG biết genesis: ngần này lần đọc LIÊN TIẾP thấp hơn mốc mới coi là reset
+# Lần đọc chỉ "thấp hơn mốc" khi thấp hơn QUÁ ngần này FLOP: số trong sổ đi qua phép làm tròn (float, _fmt), số chain
+# là raw chính xác — chênh cỡ 1e-14 không phải chain đọc thiếu, càng không phải mạng reset.
+CHAIN_LOW_EPS = Decimal("0.000000001")
+
+
 def confirm_gateway_attribution(onchain_total, token: str = None, *, path: str = None,
-                                log=print) -> dict:
+                                log=print, read_at=None, chain_id: str = None, exclude=None) -> dict:
     """Chain (explorer) báo ví mình đã chi `onchain_total` FLOP: phần chi qua gateway đang chờ (tối đa
     phần chain mới ghi thêm) trở thành chi tiêu đã xác nhận: vào thước đo airdrop và trừ số dư ví.
-    Chỉ ở chế độ testnet."""
+    Chỉ ở chế độ testnet.
+
+    Tổng on-chain đếm lại từ 0 khi mạng reset. Phần "chain ghi thêm" vì thế tính theo KỲ của chain
+    (`gateway_epoch_done` = phần đã xác nhận trong kỳ hiện tại, `gateway_chain_hw` = tổng cao nhất đã
+    đọc trong kỳ), không theo tổng cộng dồn `gateway_attributed`: nếu không, sau reset tổng mới luôn
+    nhỏ hơn số đã xác nhận ở kỳ cũ, không khoản nào được xác nhận nữa và cổng đứng tên khoá vĩnh viễn.
+
+    Khi nào một số đọc THẤP hơn mốc là reset thật chứ không phải explorer chập chờn (đang index lại
+    trả 0 vài giờ rồi trả lại số cũ — mở kỳ mới lúc đó sẽ xác nhận nhầm khoản chờ bằng chi tiêu cũ):
+      · `chain_id` (genesis hash gateway báo) KHÁC cái đã ghi của kỳ -> reset, mở kỳ mới ngay;
+      · `chain_id` TRÙNG cái đã ghi -> cùng một chain: số thấp là lỗi đọc, không bao giờ mở kỳ mới;
+      · không có genesis để so (một trong hai bên trống) -> CHAIN_RESET_READINGS lần đọc khác nhau
+        liền nhau (`read_at` khác nhau; None = mỗi lần gọi là một lần đọc).
+
+    `exclude` = phần chain ghi cho ví mà CHẮC KHÔNG phải gateway và CHƯA vào sổ (escrow các kênh mua trực tiếp
+    còn chờ ghi sổ): chỉ trừ khi tính phần MỚI được xác nhận, KHÔNG trừ vào số đọc dùng để phát hiện reset —
+    trừ vào đó thì số đã điều chỉnh có thể thấp hơn mốc và bị coi là "đọc thấp", 3 lần liền là mở kỳ mới nhầm
+    rồi xác nhận nhầm mọi khoản chờ."""
     token = (token or default_token())
     total = _parse_amount(onchain_total)
-    if ledger_mode() != "testnet" or total is None or total <= 0:
+    if ledger_mode() != "testnet" or total is None or total < 0:
         return {"outcome": "no_change"}
+    cid = str(chain_id or "").strip().lower()[:80]
     state = load_ledger(path)
     pend_map = state.setdefault("gateway_unattributed", {})
     done_map = state.setdefault("gateway_attributed", {})
     pend = _parse_amount(pend_map.get(token, "0")) or Decimal(0)
     done = _parse_amount(done_map.get(token, "0")) or Decimal(0)
-    newly = min(pend, total - done)
+    hw_map = state.setdefault("gateway_chain_hw", {})
+    ep_map = state.setdefault("gateway_epoch_done", {})
+    low_map = state.setdefault("gateway_chain_low", {})
+    id_map = state.setdefault("gateway_chain_id", {})
+    known = str(id_map.get(token) or "")
+    # Sổ cũ chưa có hai khoá kỳ: trước giờ chỉ có một kỳ, nên kỳ hiện tại = toàn bộ phần đã xác nhận.
+    epoch_done = _parse_amount(ep_map.get(token, _fmt(done))) or Decimal(0)
+    hw = _parse_amount(hw_map.get(token, _fmt(epoch_done))) or Decimal(0)
+    hw = max(hw, epoch_done)                 # chain không thể ghi ít hơn phần nó đã xác nhận trong kỳ
+    if total < hw - CHAIN_LOW_EPS:
+        reset = bool(cid and known and cid != known)
+        if cid and known and cid == known:
+            low_map.pop(token, None)
+            _save_ledger(state, path)
+            log(f"[ledger] chain ghi {_fmt(total)} {token} < mốc {_fmt(hw)} nhưng genesis không đổi — "
+                "explorer đọc thiếu, bỏ qua lần đọc này")
+            return {"outcome": "low_reading"}
+        if not reset:
+            low = low_map.get(token) if isinstance(low_map.get(token), dict) else {}
+            if read_at is not None and low.get("at") == read_at:
+                return {"outcome": "no_change"}  # cùng một lần đọc được đưa vào lại, không đếm hai lần
+            n = int(low.get("n") or 0) + 1
+            if n < CHAIN_RESET_READINGS:
+                low_map[token] = {"n": n, "at": read_at, "total": _fmt(total)}
+                _save_ledger(state, path)
+                log(f"[ledger] chain ghi {_fmt(total)} {token} < mốc {_fmt(hw)} của kỳ (lần {n}/"
+                    f"{CHAIN_RESET_READINGS}, không có genesis để so) — chờ thêm lần đọc xác nhận mạng reset")
+                return {"outcome": "low_reading"}
+        log(f"[ledger] chain reset ({'genesis đổi' if reset else f'{CHAIN_RESET_READINGS} lần đọc thấp liền'}): "
+            f"tổng on-chain {_fmt(total)} < mốc {_fmt(hw)} — mở kỳ mới "
+            f"({_fmt(epoch_done)} {token} đã xác nhận ở kỳ cũ giữ nguyên)")
+        # Chi TRỰC TIẾP ghi sổ từ lần đọc nhất quán gần nhất nằm trên chain MỚI (lúc đó chain cũ còn khớp): đưa vào
+        # kỳ mới. Đặt 0 thì chain mới đã có khoản đó mà kỳ mới không biết -> cổng gateway đọc nó thành "gateway đứng
+        # tên ví mình" và xác nhận nhầm (đo: 58.5 FLOP). Lỡ có một phiên chain cũ trong đó thì cổng chỉ chặt hơn.
+        carry = min(total, _parse_amount((state.get("direct_since_ok") or {}).get(token, "0")) or Decimal(0))
+        epoch_done, hw = carry, total
+        low_map.pop(token, None)
+        state.setdefault("direct_epoch_done", {})[token] = _fmt(carry)    # phần trực tiếp cũng theo kỳ
+        state.setdefault("direct_since_ok", {})[token] = "0"
+        if cid:
+            id_map[token] = cid
+        else:
+            id_map.pop(token, None)          # kỳ mới chưa biết genesis: không so với genesis kỳ cũ
+    else:
+        low_map.pop(token, None)
+        hw = total
+        state.setdefault("direct_since_ok", {})[token] = "0"   # lần đọc nhất quán: chi trực tiếp tới đây thuộc kỳ này
+        # Ghi genesis của kỳ ở lần đọc NHẤT QUÁN. Genesis khác mà tổng không tụt: không kết luận gì
+        # (gateway báo nhầm, hoặc chain mới đã vượt mốc cũ) — giữ cái đã ghi, lần đọc thấp sau sẽ quyết.
+        if cid and (not known or cid == known):
+            id_map[token] = cid
+    hw_map[token], ep_map[token] = _fmt(hw), _fmt(epoch_done)
+    excl = _parse_amount(exclude) if exclude is not None else Decimal(0)
+    newly = min(pend, total - epoch_done - max(Decimal(0), excl or Decimal(0)))
     if newly <= 0:
+        _save_ledger(state, path)
         return {"outcome": "no_change"}
+    ep_map[token] = _fmt(epoch_done + newly)
     _accrue_unlock(state, token, newly)
     # Chain chỉ cho TỔNG tiền, không cho số phiên: quy đổi theo tỉ lệ để số phiên khớp với tiền.
     gm = state.setdefault("gateway_counted", {})

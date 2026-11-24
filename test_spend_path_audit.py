@@ -1,6 +1,7 @@
 """Hồi quy từ audit đường chi tiêu 2026-10-31: mỗi test ứng với một lỗi đã tái hiện bằng gateway giả."""
 import json
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -180,7 +181,9 @@ def test_replay_is_off_by_default(monkeypatch):
     srv.chat_fn = timeout
     step(st, srv)
     st[fg.KEY]["wait_until"] = 0
-    assert step(st, srv, now=NOW + 900)["outcome"] == "reconciling" and len(srv.chats) == 1
+    # Còn trong khoảng biên nhận có thể xuất hiện: chờ, KHÔNG phát lại (lượt +900 gọi mới: xem
+    # test_hung_request_without_a_receipt_is_dropped_after_its_window).
+    assert step(st, srv, now=NOW + 500)["outcome"] == "reconciling" and len(srv.chats) == 1
 
 
 def test_quota_drop_after_replay_stops_further_replays(monkeypatch):
@@ -514,7 +517,7 @@ def test_large_confirmed_history_tolerates_explorer_lag():
 def test_exposure_counts_pending_receipts_and_hung_requests():
     _pending("5")
     st = {fg.KEY: {"receipts_open": {"a": [NOW, 6.5], "old-format": NOW}, "inflight": {"max_cost": 3.5},
-                   "stats": {"receipts_lost_flop": 1}}}
+                   "receipts_lost_recent": [[NOW - 60, 1]]}}
     assert ac.attribution_room(st, NOW) == pytest.approx(20 - 5 - 6.5 - 3.5 - 1)
 
 
@@ -719,3 +722,1080 @@ def test_nothing_is_written_without_miner_stats(monkeypatch):
     monkeypatch.setattr(ac, "kv_set", lambda *a, **k: pytest.fail("không có gì để ghi"))
     monkeypatch.setattr(ac, "_miner_stats", {})
     ac.persist_miner_stats(KEY, "did")
+
+
+# --- audit vòng 3: mạng reset, biên nhận trước enroll, số tiền phi lý ---------------------
+
+def _confirmed(amount="300"):
+    """Sổ đã có `amount` FLOP gateway được chain xác nhận ở kỳ hiện tại (chain ghi đúng chừng đó)."""
+    tm.credit("1000")
+    tm.record_gateway_spend(amount, "inference-session gateway m", "old-1")
+    st = {flop_radar.KEY: _chain_read(int(amount) * 10 ** 18, at=NOW - 7200)}
+    ac.gateway_attribution_step(st, NOW - 7200)
+    assert tm.gateway_attribution()["unattributed"] == 0
+
+
+def test_chain_reset_opens_a_new_epoch_instead_of_locking_the_gate():
+    _confirmed("300")
+    tm.record_gateway_spend("20", "inference-session gateway m", "new-1")
+    for at in (NOW - 3600, NOW - 1800):                           # không có genesis: cần 3 lần đọc thấp
+        st = {flop_radar.KEY: _chain_read(20 * 10 ** 18, at=at)}
+        ac.gateway_attribution_step(st, at)
+        assert tm.gateway_attribution()["unattributed"] == 20     # chưa kết luận reset
+    st = {flop_radar.KEY: _chain_read(20 * 10 ** 18, at=NOW)}
+    ac.gateway_attribution_step(st, NOW)
+    assert tm.gateway_attribution() == {"unattributed": 0, "attributed": 320}
+    assert ac.attribution_hold(st, NOW) is None
+    # Kỳ mới tiếp tục bình thường.
+    tm.record_gateway_spend("15", "inference-session gateway m", "new-2")
+    tm.confirm_gateway_attribution("35", read_at=NOW + 3600)
+    assert tm.gateway_attribution() == {"unattributed": 0, "attributed": 335}
+    assert tm.load_ledger()["session_cumulative"]["FLOP"] == "335"
+
+
+def test_one_low_explorer_reading_does_not_confirm_pending_spend_with_old_history():
+    _confirmed("300")
+    tm.record_gateway_spend("50", "inference-session gateway m", "new-1")
+    assert tm.confirm_gateway_attribution("0", read_at=NOW - 3600)["outcome"] == "low_reading"
+    tm.confirm_gateway_attribution("300", read_at=NOW)               # explorer hồi phục: số cũ
+    assert tm.gateway_attribution()["unattributed"] == 50            # không bị "xác nhận" bằng chi cũ
+
+
+def test_the_same_low_reading_is_not_counted_twice():
+    _confirmed("300")
+    tm.record_gateway_spend("20", "inference-session gateway m", "new-1")
+    for _ in range(3):
+        tm.confirm_gateway_attribution("20", read_at=NOW)
+    assert tm.gateway_attribution()["unattributed"] == 20
+
+
+def test_ledger_without_epoch_keys_detects_a_reset_that_already_happened():
+    """Sổ đã nằm trên KV từ trước bản sửa: chỉ có gateway_attributed, không có khoá kỳ."""
+    _confirmed("300")
+    led = tm.load_ledger()
+    for k in ("gateway_chain_hw", "gateway_epoch_done", "gateway_chain_low"):
+        led.pop(k, None)
+    tm.save_ledger(led)
+    tm.record_gateway_spend("20", "inference-session gateway m", "new-1")
+    for at in (NOW - 3600, NOW - 1800, NOW):
+        tm.confirm_gateway_attribution("20", read_at=at)
+    assert tm.gateway_attribution() == {"unattributed": 0, "attributed": 320}
+
+
+def test_chain_epoch_keys_go_to_kv_with_the_ledger(monkeypatch):
+    _confirmed("300")
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, k, v: sent.update({k: v}) or True)
+    ac.persist_ledger_to_kv(KEY, ac.did_of(KEY))
+    body = json.loads(sent[ac._ledger_kv_key()])["body"]
+    assert body["gateway_chain_hw"] == {"FLOP": "300"} and body["gateway_epoch_done"] == {"FLOP": "300"}
+
+
+def test_receipts_created_before_the_first_enrollment_are_not_booked():
+    st, srv = {}, Srv()                                            # ví enroll lần đầu trên mạng này
+    srv.receipts = [rc(f"old{i}", spend=2.3, created_at=(NOW - 10 * 86400) * 1000) for i in range(18)]
+    srv.receipts.append(rc("mine", spend=1.5, created_at=(NOW - 60) * 1000))
+    r = step(st, srv)
+    assert st[fg.KEY]["first_enrolled_at"] == NOW
+    assert r["pre_enroll_skipped"] == 18
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(1.5)
+    assert fg.unsettled_exposure(st[fg.KEY]) == 0
+    r2 = step(st, srv, now=NOW + 300)                             # lượt sau không đếm lại
+    assert r2["pre_enroll_skipped"] == 0 and tm.gateway_attribution()["unattributed"] == pytest.approx(1.5)
+
+
+def test_re_enrolling_on_the_same_network_keeps_late_receipts():
+    st, srv = fresh(), Srv()
+    st[fg.KEY].update(first_enrolled_at=NOW - 5000, enrolled_at=NOW - 100)
+    srv.receipts = [rc("late", spend=3.0, created_at=(NOW - 3000) * 1000)]   # trước lần enroll LẠI
+    step(st, srv)
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(3.0)
+
+
+def test_raw_unit_amount_is_held_back_reported_once_and_booked_when_fixed():
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("r1", spend="6500000000000000000")]
+    r = step(st, srv)
+    assert r["implausible_new"] == 1 and tm.gateway_attribution()["unattributed"] == 0
+    assert fg.unsettled_exposure(st[fg.KEY]) < 1000
+    r = step(st, srv, now=NOW + 300)
+    assert r["implausible_new"] == 0 and tm.gateway_attribution()["unattributed"] == 0
+    srv.receipts = [rc("r1", spend=6.5)]                           # gateway sửa số
+    step(st, srv, now=NOW + 600)
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(6.5)
+
+
+def test_implausible_amount_rules(monkeypatch):
+    assert fg.implausible_amount({}, 6.5) == ""
+    assert fg.implausible_amount({}, 6.5e18)
+    assert fg.implausible_amount({"reserved_spend": 1.0}, 10.0)
+    assert fg.implausible_amount({"reserved_spend": 1.0}, 2.5) == ""
+    assert fg.implausible_amount({}, float("nan"))
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_PER_RUN", "0")             # trần lượt tắt -> trần tuyệt đối
+    assert fg.implausible_amount({}, 5000) == "" and fg.implausible_amount({}, 2e6)
+
+
+def test_implausible_receipt_raises_one_telegram_alert(monkeypatch, telegram):
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("r1", spend="6500000000000000000")]
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    pin_now(monkeypatch, NOW)
+    ac.gateway_session_step(st, KEY, NOW)
+    ac.gateway_session_step(st, KEY, NOW + 300)
+    assert sum("phi lý" in m for m in telegram) == 1
+    assert ac.attribution_hold(st, NOW) is None
+
+
+# --- audit vòng 4: lỗ hổng trong bản sửa vòng 3 + cổng tự khoá + tên mạng ------------------------
+
+GEN_A, GEN_B = "0x" + "aa" * 16, "0x" + "bb" * 16
+
+
+def _confirmed_on(chain_id, amount="300"):
+    tm.credit("1000")
+    tm.record_gateway_spend(amount, "inference-session gateway m", "old-1")
+    tm.confirm_gateway_attribution(amount, read_at=NOW - 9000, chain_id=chain_id)
+    assert tm.gateway_attribution()["unattributed"] == 0
+
+
+def _gstep(monkeypatch, st, now):
+    """gateway_session_step với `now` thật sự là `now` (run_step nhận đúng mốc đó)."""
+    real = fg.run_step
+    monkeypatch.setattr(fg, "run_step", lambda state, **k: real(state, **{**k, "now": now}))
+    try:
+        return ac.gateway_session_step(st, KEY, now)
+    finally:
+        monkeypatch.setattr(fg, "run_step", real)
+
+
+def test_low_readings_on_the_same_genesis_never_open_a_new_epoch():
+    """Explorer index lại trả 0 nhiều giờ rồi trả lại số cũ: genesis không đổi -> không phải reset."""
+    _confirmed_on(GEN_A)
+    tm.record_gateway_spend("50", "inference-session gateway m", "broker-attributed")
+    for at in (NOW - 7200, NOW - 3600, NOW - 1800, NOW - 600):
+        assert tm.confirm_gateway_attribution("0", read_at=at, chain_id=GEN_A)["outcome"] == "low_reading"
+    tm.confirm_gateway_attribution("300", read_at=NOW, chain_id=GEN_A)
+    assert tm.gateway_attribution() == {"unattributed": 50, "attributed": 300}
+    assert tm.load_ledger()["session_cumulative"]["FLOP"] == "300"
+
+
+def test_a_new_genesis_opens_the_epoch_on_the_first_low_reading():
+    _confirmed_on(GEN_A)
+    tm.record_gateway_spend("20", "inference-session gateway m", "new-1")
+    tm.confirm_gateway_attribution("20", read_at=NOW, chain_id=GEN_B)
+    assert tm.gateway_attribution() == {"unattributed": 0, "attributed": 320}
+    assert tm.load_ledger()["gateway_chain_id"] == {"FLOP": GEN_B}
+
+
+def test_a_new_genesis_without_a_drop_does_not_reuse_old_history():
+    """Gateway báo genesis khác nhưng tổng on-chain không tụt: không đủ để kết luận reset."""
+    _confirmed_on(GEN_A)
+    tm.record_gateway_spend("20", "inference-session gateway m", "new-1")
+    tm.confirm_gateway_attribution("300", read_at=NOW - 600, chain_id=GEN_B)
+    assert tm.gateway_attribution()["unattributed"] == 20
+    assert tm.load_ledger()["gateway_chain_id"] == {"FLOP": GEN_A}       # vẫn so với genesis của kỳ
+    tm.confirm_gateway_attribution("5", read_at=NOW, chain_id=GEN_B)     # giờ mới tụt -> reset thật
+    assert tm.gateway_attribution() == {"unattributed": 15, "attributed": 305}
+
+
+def test_run_step_records_the_gateway_genesis_and_the_ledger_uses_it():
+    st, srv = fresh(), Srv()
+    plain = srv.__call__
+
+    def with_genesis(method, url, headers=None, json=None, timeout=20):
+        if url.endswith("/health"):
+            return R(200, {"network": {"network": "testnet", "observed_genesis_hash": GEN_A.upper().replace("0X", "0x")}})
+        return plain(method, url, headers=headers, json=json, timeout=timeout)
+
+    step(st, with_genesis)
+    assert st[fg.KEY]["genesis"] == GEN_A
+    _pending("30")
+    st[flop_radar.KEY] = _chain_read(30 * 10 ** 18)
+    ac.gateway_attribution_step(st, NOW)
+    assert tm.load_ledger()["gateway_chain_id"] == {"FLOP": GEN_A}
+
+
+def test_genesis_pin_blocks_another_chain(monkeypatch):
+    srv = Srv()
+    plain = srv.__call__
+
+    def with_genesis(method, url, headers=None, json=None, timeout=20):
+        if url.endswith("/health"):
+            return R(200, {"network": {"network": "testnet", "observed_genesis_hash": GEN_A}})
+        return plain(method, url, headers=headers, json=json, timeout=timeout)
+
+    monkeypatch.setenv("FLOP_GATEWAY_GENESIS", GEN_B)
+    assert step(fresh(), with_genesis)["outcome"] == "network_mismatch" and srv.chats == []
+    assert step(fresh(), srv)["outcome"] == "network_mismatch"            # /health không có genesis
+    monkeypatch.setenv("FLOP_GATEWAY_GENESIS", GEN_A)
+    assert step(fresh(), with_genesis)["outcome"] == "spent"
+
+
+def test_state_loss_does_not_reset_the_first_enrollment_mark(monkeypatch, telegram):
+    """Mất state.json: mốc lọc lấy lại từ khoá bền -> biên nhận của chính mình settle trước đó vẫn ghi sổ."""
+    srv = Srv()
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    st = {}
+    _gstep(monkeypatch, st, NOW - 7200)                                   # enroll lần đầu, mua
+    assert st["gateway_inflight"]["first_enrolled_at"] == NOW - 7200
+    srv.receipts = [rc("mine-late", spend=4.0, created_at=(NOW - 3600) * 1000)]
+    st2 = {"gateway_inflight": st["gateway_inflight"]}                    # thứ hydrate từ KV trả lại
+    _gstep(monkeypatch, st2, NOW)
+    assert st2[fg.KEY]["first_enrolled_at"] == NOW - 7200
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(4.0)
+
+
+def test_lost_receipts_stop_counting_as_pending_after_a_day():
+    g = {"receipts_lost_recent": [[NOW - 90000, 30], [NOW - 60, 2.5]], "stats": {"receipts_lost_flop": 999}}
+    assert fg.lost_exposure(g, NOW) == pytest.approx(2.5)
+    assert fg.unsettled_exposure(g, NOW) == pytest.approx(2.5)
+    assert fg.lost_exposure(g) == pytest.approx(32.5)
+
+
+def test_cumulative_lost_total_no_longer_locks_the_gate():
+    _confirmed("30")
+    st = {flop_radar.KEY: _chain_read(30 * 10 ** 18),
+          fg.KEY: {"stats": {"receipts_lost": 5, "receipts_lost_flop": 32.5}}}
+    assert ac.attribution_hold(st, NOW) is None and ac.attribution_room(st, NOW) == pytest.approx(30)
+
+
+def test_chain_spend_beyond_the_ledger_offsets_recently_lost_receipts():
+    _confirmed("30")
+    g = {"receipts_lost_recent": [[NOW - 600, 25]]}
+    st = {flop_radar.KEY: _chain_read(30 * 10 ** 18), fg.KEY: g}
+    assert ac.attribution_room(st, NOW) == pytest.approx(30 - 25)         # chain chưa ghi phần mất dấu
+    st = {flop_radar.KEY: _chain_read(60 * 10 ** 18), fg.KEY: g}          # chain ghi dư 30 so với sổ
+    assert ac.attribution_room(st, NOW) == pytest.approx(60)
+
+
+def test_a_lost_receipt_is_recorded_with_its_time():
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("late", state="estimated", spend=0, reserved_spend=6.5)]
+    srv.chat_fn = lambda b, h: R(429, {"error": "x"})
+    step(st, srv)
+    st[fg.KEY]["wait_until"] = 0
+    srv.receipts = [rc(f"n{i}") for i in range(20)]
+    step(st, srv, now=NOW + 700)
+    assert st[fg.KEY]["receipts_lost_recent"] == [[NOW + 700, 6.5]]
+    assert fg.lost_exposure(st[fg.KEY], NOW + 700 + 86400) == 0
+
+
+def _held(monkeypatch, amount="30"):
+    tm.credit("100")
+    tm.record_gateway_spend(amount, "inference-session gateway m", "broker-1")
+    srv = Srv()
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    st = fresh()
+    return st, srv
+
+
+def _run_at(monkeypatch, st, now, chain_raw=0):
+    st[flop_radar.KEY] = _chain_read(chain_raw, at=now)
+    return _gstep(monkeypatch, st, now)[0].split("/")[-1]
+
+
+def test_gate_probes_once_per_interval_while_holding(monkeypatch, telegram):
+    st, srv = _held(monkeypatch)
+    assert _run_at(monkeypatch, st, NOW) == "attribution_hold"
+    assert _run_at(monkeypatch, st, NOW + 3 * 3600) == "attribution_hold" and srv.chats == []
+    assert _run_at(monkeypatch, st, NOW + 6 * 3600) == "spent" and len(srv.chats) == 1    # lượt thăm dò
+    assert st[ac.ATTRIB_PROBE_KEY] == {"at": NOW + 6 * 3600, "pend": "30", "chain": 0.0, "direct": 0.0}
+    assert _run_at(monkeypatch, st, NOW + 6 * 3600 + 300) == "attribution_hold" and len(srv.chats) == 1
+    assert _run_at(monkeypatch, st, NOW + 12 * 3600) == "spent" and len(srv.chats) == 2
+    assert st[ac.ATTRIB_PROBE_KEY]["chain"] == 0.0                         # giữ mốc của lượt đầu
+
+
+def test_probe_call_is_one_minimal_call():
+    st, srv = fresh(), Srv(quota=500000.0)
+    r = step(st, srv, gate=lambda: ("giữ", 0.0), probe=lambda: True)
+    assert r["outcome"] == "spent" and r["probe"] is True and len(srv.chats) == 1
+    assert srv.chats[0]["body"]["max_tokens"] < 200
+
+
+def test_probe_can_be_turned_off(monkeypatch, telegram):
+    monkeypatch.setenv("FLOP_ATTRIB_PROBE_HOURS", "0")
+    st, srv = _held(monkeypatch)
+    for h in (0, 6, 12, 24):
+        assert _run_at(monkeypatch, st, NOW + h * 3600) == "attribution_hold"
+    assert srv.chats == []
+
+
+def test_probe_also_covers_room_smaller_than_one_call(monkeypatch, telegram):
+    st, srv = _held(monkeypatch, "19.99")
+    assert _run_at(monkeypatch, st, NOW) == "attribution_hold"
+    assert _run_at(monkeypatch, st, NOW + 6 * 3600) == "spent" and len(srv.chats) == 1
+
+
+def _own_channels(monkeypatch, own=True):
+    """Explorer: kênh của biên nhận gateway đứng tên ví mình (own) hoặc broker."""
+    me = fg.wallet_address(fg.wallet_key(KEY))
+    broker = fg.ss58_encode(bytes([5]) * 32)
+    monkeypatch.setattr(ac, "channel_info", lambda net, cid: {"agent": me if own else broker, "miner": "5M"})
+
+
+def test_probe_seen_on_chain_writes_off_foreign_spend_and_reopens_the_gate(monkeypatch, telegram):
+    _own_channels(monkeypatch)                                              # kênh thăm dò đứng tên ví mình
+    st, srv = _held(monkeypatch)
+    st[ac.FOREIGN_SEEN_KEY] = NOW - 100
+    _run_at(monkeypatch, st, NOW)
+    t = NOW + 6 * 3600
+    assert _run_at(monkeypatch, st, t) == "spent" and len(srv.chats) == 1
+    srv.receipts = [rc("probe", spend=0.05, created_at=t * 1000)]          # lượt thăm dò settle
+    assert _run_at(monkeypatch, st, t + 300) == "attribution_hold"         # đã ghi sổ, chain chưa đọc lại
+    st[flop_radar.KEY] = _chain_read(5 * 10 ** 16, at=t + 600)             # explorer: ví mình +0.05
+    ac.gateway_attribution_step(st, t + 600)
+    led = tm.load_ledger()
+    assert led["gateway_written_off"] == {"FLOP": "30"}
+    ga = tm.gateway_attribution()
+    assert ga["unattributed"] == 0 and float(ga["attributed"]) == pytest.approx(0.05)
+    assert led["session_cumulative"]["FLOP"] == "0.05"                      # khoản cũ KHÔNG vào thước đo
+    assert not st.get(ac.FOREIGN_SEEN_KEY) and ac.ATTRIB_PROBE_KEY not in st
+    assert sum("thăm dò" in m for m in telegram) == 1
+    assert ac.attribution_hold(st, t + 600) is None
+    before = len(srv.chats)
+    assert _run_at(monkeypatch, st, t + 900, chain_raw=5 * 10 ** 16) == "spent" and len(srv.chats) > before
+
+
+def test_probe_not_seen_on_chain_changes_nothing(monkeypatch, telegram):
+    st, srv = _held(monkeypatch)
+    _run_at(monkeypatch, st, NOW)
+    t = NOW + 6 * 3600
+    _run_at(monkeypatch, st, t)
+    st[flop_radar.KEY] = _chain_read(0, at=t + 600)                        # chain vẫn không ghi gì cho ví
+    ac.gateway_attribution_step(st, t + 600)
+    assert tm.gateway_attribution()["unattributed"] == 30
+    assert "gateway_written_off" not in tm.load_ledger() and ac.ATTRIB_PROBE_KEY in st
+    assert ac.attribution_hold(st, t + 600) is not None
+
+
+def test_written_off_spend_goes_to_kv_with_the_ledger(monkeypatch):
+    _pending("30")
+    assert tm.write_off_gateway_pending("12") == 12
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, k, v: sent.update({k: v}) or True)
+    ac.persist_ledger_to_kv(KEY, ac.did_of(KEY))
+    assert json.loads(sent[ac._ledger_kv_key()])["body"]["gateway_written_off"] == {"FLOP": "12"}
+    assert tm.gateway_attribution()["unattributed"] == 18
+
+
+def test_testnet_with_its_own_name_can_be_declared(monkeypatch, telegram):
+    srv = Srv(net="aurora-1")
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    pin_now(monkeypatch, NOW)
+    assert ac.gateway_session_step(fresh(), KEY, NOW)[0].endswith("gateway/network_mismatch")
+    monkeypatch.setenv("FLOP_TESTNET_NETWORK_NAME", "Aurora-1")
+    assert ac.gateway_session_step(fresh("aurora-1"), KEY, NOW)[0].endswith("gateway/spent") and srv.chats
+    assert ac._explorer_base("aurora-1") == "https://explorer.testnet.flop.network"
+
+
+def test_declared_testnet_name_cannot_be_a_devnet(monkeypatch):
+    srv = Srv(net="flop-devnet")
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    monkeypatch.setenv("FLOP_TESTNET_NETWORK_NAME", "flop-devnet")
+    assert ac.gateway_session_step(fresh("flop-devnet"), KEY, NOW)[0] == "skip-network-config"
+    assert srv.chats == []
+
+
+def test_hold_marks_are_cleared_once_the_gate_lets_a_normal_buy_through(monkeypatch, telegram):
+    srv = Srv()
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    st = fresh()
+    st.update({ac.ATTRIB_HOLD_SINCE_KEY: NOW - 99999, ac.ATTRIB_PROBE_KEY: {"at": NOW - 9, "chain": 0.0, "pend": "30"}})
+    assert _run_at(monkeypatch, st, NOW) == "spent"
+    assert ac.ATTRIB_HOLD_SINCE_KEY not in st and ac.ATTRIB_PROBE_KEY not in st
+    _pending("30")                                                # đợt dừng MỚI: lượt đầu chỉ ghi mốc
+    assert _run_at(monkeypatch, st, NOW + 300) == "attribution_hold"
+    assert st[ac.ATTRIB_HOLD_SINCE_KEY] == NOW + 300 and len(srv.chats) >= 1
+    n = len(srv.chats)
+    assert _run_at(monkeypatch, st, NOW + 600) == "attribution_hold" and len(srv.chats) == n
+
+
+# --- re-audit: N1 mốc thăm dò từ số đọc cũ, N2 created_at không phải giờ thực -----------------
+
+def test_probe_baseline_uses_the_ledger_high_water_when_the_reading_is_stale(monkeypatch, telegram):
+    tm.credit("1000")
+    tm.record_gateway_spend("300", "inference-session gateway m", "own-old")
+    tm.confirm_gateway_attribution("300", read_at=NOW - 90000)
+    tm.record_gateway_spend("330", "inference-session gateway m", "broker-1")
+    srv = Srv()
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    st = fresh()
+    st[flop_radar.KEY] = _chain_read(300 * 10 ** 18, at=NOW - 8 * 3600)          # số đọc đã cũ
+    for now in (NOW, NOW + 6 * 3600):
+        _gstep(monkeypatch, st, now)
+    assert st[ac.ATTRIB_PROBE_KEY]["chain"] == 300.0
+    t = NOW + 6 * 3600 + 600
+    st[flop_radar.KEY] = _chain_read(300 * 10 ** 18, at=t)                       # hồi phục: VẪN 300
+    ac.gateway_attribution_step(st, t)
+    assert tm.gateway_attribution()["unattributed"] == 330
+    assert "gateway_written_off" not in tm.load_ledger() and ac.attribution_hold(st, t) is not None
+
+
+def test_non_wall_clock_created_at_is_not_treated_as_pre_enrollment():
+    st, srv = {}, Srv()
+    step(st, srv)
+    srv.receipts = [rc("mine", spend=2.0, created_at=123456)]
+    r = step(st, srv, now=NOW + 300)
+    assert r["pre_enroll_skipped"] == 0 and tm.gateway_attribution()["unattributed"] == pytest.approx(2.0)
+
+
+# --- T6: request treo không tới server + mức nền khi explorer cũ ---------------------------------
+
+def _hung(srv=None, **inf):
+    st, srv = fresh(), srv or Srv()
+    srv.chat_fn = timeout
+    r = step(st, srv)
+    assert r["outcome"] == "unknown_outcome"
+    st[fg.KEY]["inflight"].update(inf)
+    srv.chat_fn = lambda b, h: ok_chat()
+    return st, srv
+
+
+def test_unknown_outcome_backs_off_only_until_a_receipt_could_show_up():
+    st, _ = _hung()
+    wait = st[fg.KEY]["wait_until"] - NOW
+    assert 300 <= wait < 900 and wait == fg.unknown_backoff_sec(st[fg.KEY]["inflight"])
+
+
+def test_hung_request_without_a_receipt_is_dropped_after_its_window():
+    st, srv = _hung()
+    edge = fg.inflight_window(st[fg.KEY]["inflight"])[1] + fg.INFLIGHT_NO_RECEIPT_GRACE_SEC
+    st[fg.KEY]["wait_until"] = 0
+    assert step(st, srv, now=int(edge) - 30)["outcome"] == "reconciling" and len(srv.chats) == 1
+    r = step(st, srv, now=int(edge) + 1)
+    assert r["outcome"] == "spent" and len(srv.chats) >= 2 and "inflight" not in st[fg.KEY]
+    assert srv.chats[0]["prompt"] not in [c["prompt"] for c in srv.chats[1:]]   # đề treo KHÔNG gửi lại
+
+
+def test_the_whole_stall_is_now_one_backoff_not_thirty_minutes():
+    st, srv = _hung()
+    seq = []
+    for dt in range(300, 1801, 300):
+        seq.append(step(st, srv, now=NOW + dt)["outcome"])
+    assert seq.index("spent") <= 2 and "reconciling" not in seq[:seq.index("spent")][1:]
+
+
+@pytest.mark.parametrize("case", ["quota_dropped", "receipts_unreadable", "receipt_in_window",
+                                  "receipt_without_time", "relative_time", "replayed"])
+def test_hung_request_is_kept_when_arrival_cannot_be_ruled_out(case):
+    srv = Srv()
+    st, srv = _hung(srv)
+    inf = st[fg.KEY]["inflight"]
+    late = int(fg.inflight_window(inf)[1] + fg.INFLIGHT_NO_RECEIPT_GRACE_SEC) + 10
+    if case == "quota_dropped":
+        srv.quota -= 0.5
+    elif case == "receipts_unreadable":
+        plain = srv.__call__
+        srv_call = lambda m, u, headers=None, json=None, timeout=20: (            # noqa: E731
+            R(503, {"error": "busy"}) if u.endswith("/keys/me/receipts") else plain(m, u, headers, json, timeout))
+        srv = srv_call
+    elif case == "receipt_in_window":
+        srv.receipts = [rc("x", state="pending", spend=None, created_at=(NOW + 5) * 1000),
+                        rc("y", state="pending", spend=None, created_at=(NOW + 9) * 1000)]
+    elif case == "receipt_without_time":
+        srv.receipts = [rc("old", spend=1.0)]
+    elif case == "relative_time":
+        srv.receipts = [rc("old", spend=1.0, created_at=123456)]
+    elif case == "replayed":
+        inf["replays"] = 1
+    st[fg.KEY]["wait_until"] = 0
+    assert step(st, srv, now=late)["outcome"] == "reconciling"
+    assert "inflight" in st[fg.KEY]
+
+
+def test_quota_at_send_time_survives_state_loss(monkeypatch, telegram):
+    srv = Srv()
+    srv.chat_fn = timeout
+    monkeypatch.setattr(ac, "_gateway_http", srv)
+    st = fresh()
+    _gstep(monkeypatch, st, NOW)
+    assert st["gateway_inflight"]["inflight"]["quota"] == pytest.approx(1000.0)
+
+
+def test_stale_reading_keeps_the_confirmed_history_as_the_allowance():
+    tm.credit("1000")
+    tm.record_gateway_spend("500", "inference-session gateway m", "a")
+    st = {flop_radar.KEY: _chain_read(500 * 10 ** 18)}
+    ac.gateway_attribution_step(st, NOW)
+    tm.record_gateway_spend("25", "inference-session gateway m", "b")
+    assert ac.attribution_room(st, NOW) == pytest.approx(475)
+    assert ac.attribution_room(st, NOW + 7 * 3600) == pytest.approx(475)        # explorer im 7 giờ
+    assert ac.attribution_hold(st, NOW + 7 * 3600) is None
+    assert ac.chain_for_gate(st, NOW + 7 * 3600)[1] == "ledger"
+
+
+def test_stale_fallback_ends_after_two_days_and_needs_history():
+    tm.credit("1000")
+    tm.record_gateway_spend("500", "inference-session gateway m", "a")
+    st = {flop_radar.KEY: _chain_read(500 * 10 ** 18)}
+    ac.gateway_attribution_step(st, NOW)
+    tm.record_gateway_spend("25", "inference-session gateway m", "b")
+    later = NOW + ac.ATTRIB_STALE_MAX_SEC + 60
+    assert ac.attribution_room(st, later) == pytest.approx(20 - 25)
+    assert "chưa đọc được explorer" in ac.attribution_hold(st, later)
+    assert ac.chain_for_gate({}, NOW) == (None, "none")                         # chưa từng đọc
+
+
+def test_stale_fallback_never_counts_as_a_confirmation():
+    """Mức nền chỉ nới hạn mức; không có số đọc mới thì không khoản chờ nào được xác nhận."""
+    tm.credit("1000")
+    tm.record_gateway_spend("500", "inference-session gateway m", "a")
+    st = {flop_radar.KEY: _chain_read(500 * 10 ** 18)}
+    ac.gateway_attribution_step(st, NOW)
+    tm.record_gateway_spend("25", "inference-session gateway m", "b")
+    ac.gateway_attribution_step(st, NOW + 7 * 3600)
+    assert tm.gateway_attribution() == {"unattributed": 25, "attributed": 500}
+
+
+# --- các mục Low còn lại -----------------------------------------------------------------------
+
+def test_receipts_sharing_a_channel_are_booked_separately():
+    st, srv = fresh(), Srv()
+    srv.receipts = [{"channel_id": "chan-1", "state": "settled", "settled_spend": s, "model": "m",
+                     "created_at": (NOW - 600 + i) * 1000} for i, s in enumerate((1.0, 2.0, 3.0))]
+    step(st, srv)
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(6.0)
+    step(st, srv, now=NOW + 300)                                     # lượt sau không ghi lại
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(6.0)
+
+
+def test_receipt_key_still_prefers_request_id():
+    assert fg._receipt_key({"request_id": "abc", "channel_id": "c"}) == "abc"
+    assert fg._receipt_key({"tx_hash": "0x1", "channel_id": "c"}) == "0x1"
+
+
+def test_own_wallet_under_another_ss58_prefix_is_not_foreign():
+    pub = fg._raw_pub(KEY)
+    mine_42 = fg.wallet_address(KEY)
+    mine_0 = fg.ss58_encode(pub, prefix=0)
+    assert mine_0 != mine_42 and fg.same_account(mine_0, mine_42)
+    assert fg.same_account("0x" + pub.hex(), mine_42)
+    other = fg.ss58_encode(bytes(32))
+    assert not fg.same_account(other, mine_42)
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("r1")]
+    r = fg.run_step(st, agent_key=KEY, http=srv, now=NOW, prompts=["p1"], expect_network="testnet",
+                    book_fn=book, log=lambda m: None, sleep=lambda s: None, rng=lambda: 0.5,
+                    channel_fn=lambda cid: {"agent": mine_0, "miner": "m1"})
+    assert r["foreign_channels"] == 0
+
+
+def test_account_pubkey_rejects_garbage():
+    addr = fg.wallet_address(KEY)
+    bad = addr[:-1] + ("A" if addr[-1] != "A" else "B")              # sai checksum
+    assert fg.account_pubkey(bad) is None and fg.account_pubkey("hello") is None
+    assert fg.account_pubkey(None) is None
+
+
+@pytest.mark.parametrize("msg", [
+    '{"body":{"last_seq":1},"note":"api.flop.network ADDR"}',      # thân KV niêm phong
+    'api.flop.network|1800000000000|hi ADDR',                        # canonical tin chat
+    'ns|api.flop.network|1800000000000|ADDR',                       # canonical KV ký
+    'did:key:z6Mk|FLOP|1|1800000000000|api.flop.network ADDR',       # giao dịch
+    'api.flop.network.evil.example wants ADDR',                      # host là chuỗi con
+    'evil-api.flop.network wants ADDR',
+])
+def test_challenge_shapes_signed_elsewhere_are_refused(msg):
+    addr = fg.wallet_address(KEY)
+    assert fg.challenge_problem(msg.replace("ADDR", addr), addr, "https://api.flop.network")
+
+
+def test_a_normal_enrollment_challenge_is_accepted():
+    addr = fg.wallet_address(KEY)
+    for lines in (["api.flop.network enroll", addr, "nonce"],
+                  ["api.flop.network wants you to sign in with your FLOP account:", addr, "Nonce: 7f3a"],
+                  ["Sign in to https://api.flop.network.", addr]):
+        msg = "\n".join(lines)
+        assert fg.challenge_problem(msg, addr, "https://api.flop.network") == "", msg
+
+
+def test_receipts_are_still_read_during_a_long_non_rate_backoff():
+    st, srv = fresh(), Srv()
+    st[fg.KEY].update(wait_until=NOW + 3600, wait_why="403 forbidden", receipts_read_at=NOW - 1000)
+    srv.receipts = [rc("late", spend=2.0)]
+    r = step(st, srv)
+    assert r["outcome"] == "backoff" and srv.chats == []
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(2.0)
+    assert st[fg.KEY]["wait_until"] == NOW + 3600                    # không đổi lịch nghỉ
+    srv.receipts.append(rc("later", spend=1.0))
+    step(st, srv, now=NOW + 300)                                     # < 15 phút: không đọc lại
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("why", ["429 rate_limited", "503 x", "overloaded", "no_admitted_miner"])
+def test_rate_limit_backoff_makes_no_requests(why):
+    calls = []
+    st = fresh()
+    st[fg.KEY].update(wait_until=NOW + 600, wait_why=why)
+    srv = Srv()
+    r = step(st, lambda *a, **k: calls.append(a) or srv(*a, **k))
+    assert r["outcome"] == "backoff" and calls == []
+
+
+def test_late_receipts_of_the_previous_bearer_are_still_booked():
+    st, srv = fresh(), Srv()
+    st[fg.KEY]["expires_at"] = (NOW + 60) * 1000                     # bearer cũ sắp hết hạn -> enroll lại
+    seen = []
+    plain = srv.__call__
+
+    def by_bearer(method, url, headers=None, json=None, timeout=20):
+        if url.endswith("/keys/me/receipts"):
+            tok = (headers or {}).get("Authorization", "")
+            seen.append(tok)
+            return R(200, {"receipts": [rc("old-late", spend=3.0)] if tok == "Bearer tok" else []})
+        return plain(method, url, headers=headers, json=json, timeout=timeout)
+
+    step(st, by_bearer)
+    assert "Bearer tok" in seen and "Bearer newtok" in seen
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(3.0)
+    assert fg.open_bearer(KEY, st[fg.KEY]["vault"]) == "newtok"
+
+
+def test_previous_bearer_is_dropped_when_rejected_or_expired():
+    st, srv = fresh(), Srv()
+    st[fg.KEY].update(vault_prev=fg.seal_bearer(KEY, "old"), vault_prev_until=NOW - 1)
+    step(st, srv)
+    assert "vault_prev" not in st[fg.KEY]
+    st[fg.KEY].update(vault_prev=fg.seal_bearer(KEY, "old"), vault_prev_until=NOW + 9999)
+    plain = srv.__call__
+
+    def reject_old(method, url, headers=None, json=None, timeout=20):
+        if url.endswith("/keys/me/receipts") and (headers or {}).get("Authorization") == "Bearer old":
+            return R(401, {"error": "expired"})
+        return plain(method, url, headers=headers, json=json, timeout=timeout)
+
+    step(st, reject_old, now=NOW + 300)
+    assert "vault_prev" not in st[fg.KEY]
+
+
+def test_ledger_writes_are_atomic(monkeypatch, tmp_path):
+    p = tmp_path / "led.json"
+    tm.credit("10", path=str(p))
+    real_dump = tm.json.dump
+
+    def boom(obj, f, **k):
+        f.write("{partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tm.json, "dump", boom)
+    assert tm._save_ledger({"balances": {}, "entries": []}, str(p)) is False
+    monkeypatch.setattr(tm.json, "dump", real_dump)
+    assert tm.check_balance(path=str(p)) == "10"                     # file cũ còn nguyên
+
+
+# --- biên nhận chờ settle đã rời 20 cái gần nhất: đọc lại theo request_id ------------------------
+
+class ById(Srv):
+    """Gateway giả: danh sách chỉ trả `listed`; GET /keys/me/receipts/{id} trả từ `book` (mọi biên nhận)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.book, self.by_id, self.by_id_status = {}, [], {}
+
+    def __call__(self, method, url, headers=None, json=None, timeout=20):
+        if "/keys/me/receipts/" in url:
+            rid = url.rsplit("/", 1)[-1]
+            self.by_id.append((rid, (headers or {}).get("Authorization")))
+            if not (headers or {}).get("Authorization"):
+                return R(401, {"error": "missing_credential"})       # như gateway thật: phải có bearer
+            code = self.by_id_status.get(rid)
+            if code:
+                return R(code, {"error": "x"})
+            rc = self.book.get(rid)
+            return R(200, rc) if rc else R(404, {"error": "receipt_not_found"})
+        return super().__call__(method, url, headers=headers, json=json, timeout=timeout)
+
+
+def _pending_then_gone(srv, st, rid="late", reserved=6.5):
+    """Biên nhận `rid` được thấy ĐANG CHỜ ở lượt NOW, rồi rời danh sách (20 biên nhận mới hơn)."""
+    pend = rc(rid, state="estimated", spend=None, reserved_spend=reserved, created_at=(NOW - 60) * 1000)
+    srv.receipts = [pend]
+    srv.book[rid] = pend
+    srv.chat_fn = lambda b, h: R(429, {"error": "x"})
+    step(st, srv)
+    assert rid in st[fg.KEY]["receipts_open"] and st[fg.KEY]["receipts_open"][rid][2] == rid
+    st[fg.KEY]["wait_until"] = 0
+    srv.receipts = [rc(f"n{i}", created_at=(NOW + i) * 1000) for i in range(20)]
+
+
+def test_receipt_that_settles_after_leaving_the_window_is_booked():
+    st, srv = fresh(), ById()
+    _pending_then_gone(srv, st)
+    step(st, srv, now=NOW + 700)                                      # vẫn chờ: không mất, không ghi
+    assert "late" in st[fg.KEY]["receipts_open"] and not st[fg.KEY]["stats"].get("receipts_lost")
+    srv.book["late"] = rc("late", spend=6.0, reserved_spend=6.5, created_at=(NOW - 60) * 1000)
+    st[fg.KEY]["wait_until"] = 0
+    step(st, srv, now=NOW + 1400)
+    assert "late" not in st[fg.KEY]["receipts_open"] and not st[fg.KEY]["stats"].get("receipts_lost")
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(6.0 + 20 * 6.5)
+    step(st, srv, now=NOW + 2100)                                     # không ghi lại
+    assert tm.gateway_attribution()["unattributed"] == pytest.approx(6.0 + 20 * 6.5)
+
+
+def test_receipt_not_found_by_id_is_counted_as_lost():
+    st, srv = fresh(), ById()
+    _pending_then_gone(srv, st)
+    del srv.book["late"]
+    step(st, srv, now=NOW + 700)
+    assert st[fg.KEY]["stats"]["receipts_lost"] == 1 and "late" not in st[fg.KEY]["receipts_open"]
+
+
+def test_transient_error_reading_by_id_keeps_tracking():
+    st, srv = fresh(), ById()
+    _pending_then_gone(srv, st)
+    srv.by_id_status["late"] = 500
+    step(st, srv, now=NOW + 700)
+    assert "late" in st[fg.KEY]["receipts_open"] and not st[fg.KEY]["stats"].get("receipts_lost")
+
+
+def test_no_by_id_reads_when_the_receipt_list_is_unreadable():
+    st, srv = fresh(), ById()
+    _pending_then_gone(srv, st)
+    plain = srv.__call__
+    srv_down = lambda m, u, headers=None, json=None, timeout=20: (                    # noqa: E731
+        R(503, {"error": "busy"}) if u.endswith("/keys/me/receipts") else plain(m, u, headers, json, timeout))
+    srv.by_id.clear()
+    step(st, srv_down, now=NOW + 700)
+    assert srv.by_id == [] and "late" in st[fg.KEY]["receipts_open"]
+
+
+def test_by_id_reads_are_capped_per_run_and_rotate():
+    st, srv = fresh(), ById()
+    rids = [f"p{i}" for i in range(8)]
+    for i, rid in enumerate(rids):
+        st[fg.KEY].setdefault("receipts_open", {})[rid] = [NOW - 600 + i, 1.0, rid]
+        srv.book[rid] = rc(rid, state="estimated", spend=None, created_at=(NOW - 600 + i) * 1000)
+    srv.receipts = [rc("n0", created_at=NOW * 1000)]
+    step(st, srv)
+    first = [r for r, _ in srv.by_id]
+    assert len(first) == fg.TRACK_PER_RUN
+    srv.by_id.clear()
+    st[fg.KEY]["wait_until"] = 0
+    step(st, srv, now=NOW + 300)
+    second = [r for r, _ in srv.by_id]
+    assert set(rids) - set(first) <= set(second)                       # cái chưa đọc lượt trước được đọc trước
+
+
+def test_tracking_gives_up_after_the_ttl():
+    st, srv = fresh(), ById()
+    st[fg.KEY]["receipts_open"] = {"ancient": [NOW - fg.TRACK_TTL_SEC - 10, 2.0, "ancient"]}
+    srv.book["ancient"] = rc("ancient", state="estimated", spend=None, created_at=(NOW - 999999) * 1000)
+    srv.receipts = [rc("n0", created_at=NOW * 1000)]
+    step(st, srv)
+    assert "ancient" not in st[fg.KEY]["receipts_open"] and st[fg.KEY]["stats"]["receipts_lost"] == 1
+
+
+def test_pending_overflow_is_counted_as_lost_not_dropped_silently(monkeypatch):
+    monkeypatch.setattr(fg, "RECEIPTS_OPEN_KEEP", 3)
+    st, srv = fresh(), ById()
+    srv.receipts = [rc(f"w{i}", state="estimated", spend=None, created_at=(NOW - 60 + i) * 1000) for i in range(5)]
+    srv.chat_fn = lambda b, h: R(429, {"error": "x"})
+    step(st, srv)
+    assert len(st[fg.KEY]["receipts_open"]) == 3 and st[fg.KEY]["stats"]["receipts_lost"] == 2
+
+
+def test_legacy_pending_entry_gains_its_request_id():
+    st, srv = fresh(), ById()
+    st[fg.KEY]["receipts_open"] = {"late": [NOW - 60, 6.5]}               # bản cũ: chưa có id
+    srv.receipts = [rc("late", state="estimated", spend=None, created_at=(NOW - 60) * 1000)]
+    srv.chat_fn = lambda b, h: R(429, {"error": "x"})
+    step(st, srv)
+    assert st[fg.KEY]["receipts_open"]["late"] == [NOW - 60, 6.5, "late"]
+
+
+def test_previous_bearer_is_used_when_the_current_key_cannot_see_the_receipt():
+    st, srv = fresh(), ById()
+    _pending_then_gone(srv, st)
+    st[fg.KEY].update(vault_prev=fg.seal_bearer(KEY, "old"), vault_prev_until=NOW + 9999)
+    settled = rc("late", spend=6.0, created_at=(NOW - 60) * 1000)
+    plain = srv.__call__
+
+    def only_old(method, url, headers=None, json=None, timeout=20):
+        if url.endswith("/keys/me/receipts/late"):
+            srv.by_id.append(("late", (headers or {}).get("Authorization")))
+            ok = (headers or {}).get("Authorization") == "Bearer old"
+            return R(200, settled) if ok else R(404, {"error": "receipt_not_found"})
+        return plain(method, url, headers=headers, json=json, timeout=timeout)
+
+    step(st, only_old, now=NOW + 700)
+    assert [a for _, a in srv.by_id] == ["Bearer tok", "Bearer old"]
+    assert "late" not in st[fg.KEY]["receipts_open"] and not st[fg.KEY]["stats"].get("receipts_lost")
+
+
+def test_receipt_by_id_quotes_the_id_and_maps_404_to_none():
+    urls = []
+
+    def http(method, url, headers=None, json=None, timeout=20):
+        urls.append(url)
+        return R(404, {"error": "receipt_not_found"}) if "missing" in url else R(200, rc("a/b c"))
+
+    assert fg.receipt_by_id(http, "https://gw/v1", "t", "a/b c")["request_id"] == "a/b c"
+    assert urls[0] == "https://gw/v1/keys/me/receipts/a%2Fb%20c"
+    assert fg.receipt_by_id(http, "https://gw/v1", "t", "missing") is None
+
+
+# --- cổng đứng tên: phần chain ghi dư trừ vào CẢ biên nhận chờ (hồi quy của #254) ------------------
+
+def test_pending_receipts_stuck_estimated_are_offset_by_chain_spend():
+    """40 biên nhận kẹt `estimated` (giữ chỗ 262.5) trong khi chain đã ghi 175 cho ví mình: trước bản sửa
+    hạn mức −87.5 (dừng mua); trước #254 (đường "mất dấu") là +87.5."""
+    tm.credit("1000")
+    open_ = {f"r{i}": [NOW - 3600, 6.5625, f"r{i}"] for i in range(40)}
+    st = {flop_radar.KEY: _chain_read(175 * 10 ** 18), fg.KEY: {"receipts_open": open_}}
+    assert ac.attribution_room(st, NOW) == pytest.approx(175 - (262.5 - 175))
+    assert ac.attribution_hold(st, NOW) is None
+
+
+def test_pending_and_lost_are_offset_together_and_never_below_zero():
+    tm.credit("1000")
+    g = {"receipts_open": {"a": [NOW - 60, 10.0, "a"]}, "receipts_lost_recent": [[NOW - 60, 5.0]],
+         "inflight": {"max_cost": 2.0}}
+    st = {flop_radar.KEY: _chain_read(100 * 10 ** 18), fg.KEY: g}
+    assert ac.attribution_room(st, NOW) == pytest.approx(100)          # dư 100 > 17 chưa vào sổ
+    st = {flop_radar.KEY: _chain_read(10 * 10 ** 18), fg.KEY: g}
+    assert ac.attribution_room(st, NOW) == pytest.approx(20 - (17 - 10))
+
+
+def test_surplus_is_measured_against_the_ledger_not_double_counted():
+    """Chi đã vào sổ (đang chờ xác nhận) không được tính là "dư" để trừ thêm vào biên nhận chờ."""
+    tm.credit("1000")
+    tm.record_gateway_spend("30", "inference-session gateway m", "booked-1")
+    g = {"receipts_open": {"a": [NOW - 60, 10.0, "a"]}}
+    st = {flop_radar.KEY: _chain_read(30 * 10 ** 18), fg.KEY: g}
+    ac.gateway_attribution_step(st, NOW)                               # 30 trong sổ -> xác nhận
+    assert tm.gateway_attribution()["unattributed"] == 0
+    assert ac.attribution_room(st, NOW) == pytest.approx(30 - 10)      # chain = sổ: không dư, chờ 10 nguyên
+
+
+
+# --- chi MUA TRỰC TIẾP không được đọc thành "gateway đã đứng tên ví mình" ------------------------------------------
+
+def _direct_pending(st, *escrows, net="testnet"):
+    import flop_direct
+    st[flop_direct.KEY] = {"pending": [{"channel": "0x" + f"{i + 1:064x}", "ts": NOW, "network": net,
+                                        "max_flop": str(e)} for i, e in enumerate(escrows)]}
+
+
+def test_unbooked_direct_spend_does_not_confirm_gateway_pending(monkeypatch):
+    tm.credit("3000")
+    tm.record_gateway_spend("20", "inference-session gateway m", "broker-1")
+    tm.confirm_gateway_attribution("0", chain_id="0xaa")
+    st = {flop_radar.KEY: _chain_read(495 * 10 ** 17)}                # chain ghi THỰC TRẢ 49.5 (escrow 50) — trực tiếp
+    _direct_pending(st, "50")
+    assert ac.gateway_attribution_step(st, NOW) in ("ok", "MISMATCH")
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20")   # KHÔNG xác nhận nhầm
+    tm.record_direct_spend("49.5", "inference-session direct m", "0x" + f"{1:064x}")   # lượt sau: kênh PAID
+    st[flop_direct_key()] = {"pending": []}
+    ac.gateway_attribution_step(st, NOW + 300)
+    led = tm.load_ledger()
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20") and led["session_cumulative"]["FLOP"] == "49.5"
+
+
+def flop_direct_key():
+    import flop_direct
+    return flop_direct.KEY
+
+
+def test_gateway_confirmation_still_counts_real_gateway_growth_next_to_direct(monkeypatch):
+    tm.credit("3000")
+    tm.record_gateway_spend("20", "inference-session gateway m", "g-1")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{7:064x}")
+    # 100 trực tiếp (đã ghi) + 20 gateway; đã thấy kênh gateway đứng tên ví mình -> phần tăng là gateway thật.
+    st = {flop_radar.KEY: _chain_read(120 * 10 ** 18), ac.OWN_SEEN_KEY: NOW}
+    assert ac.gateway_attribution_step(st, NOW) == "ok"
+    assert tm.gateway_attribution()["unattributed"] == Decimal("0")
+
+
+def test_unexplained_growth_next_to_direct_is_not_confirmed_without_own_gateway_channel(monkeypatch):
+    """Đang mua trực tiếp, chain ghi thêm 20 ngoài phần trực tiếp đã biết, nhưng CHƯA thấy kênh gateway nào đứng tên ví:
+    20 đó có thể là kênh trực tiếp mất dấu (ghi KV lỗi + cache cũ). Trước đây được xác nhận thành chi gateway, mở cổng
+    đứng tên nhầm (fuzz seed 18)."""
+    tm.credit("3000")
+    tm.record_gateway_spend("20", "inference-session gateway m", "g-1")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{7:064x}")
+    st = {flop_radar.KEY: _chain_read(120 * 10 ** 18)}
+    ac.gateway_attribution_step(st, NOW)
+    assert tm.gateway_attribution()["unattributed"] == Decimal(20)
+    led = tm.load_ledger()
+    assert led["gateway_chain_hw"]["FLOP"] == "120"                    # vẫn ghi mốc kỳ (phát hiện reset chạy bình thường)
+
+
+def test_pending_direct_escrow_never_looks_like_a_chain_reset():
+    tm.credit("3000")
+    tm.record_gateway_spend("30", "inference-session gateway m", "g-1")
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{8:064x}")
+    for i in range(5):                                                 # mỗi lượt: phiên trực tiếp mới chờ ghi sổ
+        st = {flop_radar.KEY: _chain_read(int((1000 + 99 * (i + 1)) * 10 ** 18), at=NOW + i)}
+        _direct_pending(st, *(["100"] * (i + 1)))
+        assert tm.confirm_gateway_attribution(1000 + 99 * (i + 1), chain_id=None, read_at=NOW + i,
+                                              exclude=str(100 * (i + 1)))["outcome"] in ("no_change", "confirmed")
+    led = tm.load_ledger()
+    assert led["gateway_unattributed"]["FLOP"] == "30" and not led.get("gateway_chain_low", {}).get("FLOP")
+
+
+def test_direct_spend_does_not_open_the_gateway_gate(monkeypatch):
+    tm.credit("5000")
+    for i in range(5):
+        tm.record_gateway_spend("100", "inference-session gateway m", f"b-{i}")
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{9:064x}")
+    st = {flop_radar.KEY: _chain_read(1000 * 10 ** 18)}
+    assert ac.attribution_room(st, NOW) <= 0 and ac.attribution_hold(st, NOW)
+    _direct_pending(st, "200")                                         # còn kênh trực tiếp chờ: vẫn đóng
+    st[flop_radar.KEY] = _chain_read(1198 * 10 ** 18)
+    assert ac.attribution_room(st, NOW) <= 0
+
+
+def test_probe_result_ignores_direct_growth(monkeypatch, telegram):
+    tm.credit("5000")
+    tm.record_gateway_spend("500", "inference-session gateway m", "b-1")
+    st = {ac.ATTRIB_PROBE_KEY: {"at": NOW, "pend": "500", "chain": 1000.0, "direct": 1000.0},
+          ac.FOREIGN_SEEN_KEY: 3, ac.OWN_SEEN_KEY: NOW + 1}
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{10:064x}")
+    tm.record_direct_spend("80", "inference-session direct m", "0x" + f"{11:064x}")   # phiên trực tiếp sau mốc
+    ac._attrib_probe_result(st, NOW + 600, 1080.0)
+    assert tm.gateway_attribution()["unattributed"] == Decimal("500") and st[ac.FOREIGN_SEEN_KEY] == 3
+    ac._attrib_probe_result(st, NOW + 900, 1080.05)                   # +0.05 không phải trực tiếp: lượt thăm dò
+    assert tm.gateway_attribution()["unattributed"] == Decimal("0") and st[ac.FOREIGN_SEEN_KEY] == 0
+
+
+def test_direct_epoch_resets_with_the_chain_epoch():
+    tm.credit("3000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{12:064x}")
+    tm.confirm_gateway_attribution("100", chain_id="0xaa")
+    assert tm.direct_epoch_done() == Decimal("100")
+    tm.confirm_gateway_attribution("5", chain_id="0xbb")               # genesis đổi: kỳ mới
+    assert tm.direct_epoch_done() == Decimal("0")
+
+
+def test_direct_epoch_is_mirrored_to_kv(monkeypatch):
+    tm.credit("100")
+    tm.record_direct_spend("10", "inference-session direct m", "0x" + f"{13:064x}")
+    sent = []
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, key, val: sent.append(val) or True)
+    ac.persist_ledger_to_kv(None, "did:x")
+    assert sent and "direct_epoch_done" in sent[-1]
+
+
+def test_gateway_ledger_save_failure_keeps_the_receipt_unseen(monkeypatch):
+    real, broken = tm._save_ledger, [True]
+    monkeypatch.setattr(tm, "_save_ledger", lambda state, path=None: False if broken[0] else real(state, path))
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("r-save", spend=6.5)]
+    step(st, srv)
+    assert tm.load_ledger().get("gateway_unattributed", {}).get("FLOP") in (None, "0")
+    assert "r-save" not in str(st[fg.KEY].get("receipts_seen"))
+    broken[0] = False
+    step(st, srv, now=NOW + 300)
+    assert tm.gateway_attribution()["unattributed"] == Decimal("6.5")
+
+
+def test_record_gateway_spend_reports_a_failed_save(monkeypatch):
+    monkeypatch.setattr(tm, "_save_ledger", lambda state, path=None: False)
+    assert tm.record_gateway_spend("1", "inference-session gateway m", "x")["outcome"] == "save_failed"
+
+
+# --- làm tròn: sổ không được vượt chain vì float; kênh mồ côi giữ chỗ cho cổng gateway ------------------------------
+
+def test_direct_amounts_are_exact_decimals():
+    import flop_direct
+    kind, amt = flop_direct.classify_channel(
+        {"agent": "5Me", "status": "settled", "paymentStatus": "PAID", "observationHead": "finalized",
+         "minerPaid": "98956627838640000001", "burned": "0"}, "5Me")
+    assert kind == "paid" and amt == Decimal("98.956627838640000001")
+
+
+def test_rounding_noise_is_not_a_low_reading_and_never_resets_the_chain_epoch():
+    tm.credit("1000")
+    tm.record_gateway_spend("19.5", "inference-session gateway m", "g-1")
+    for i, a in enumerate((98.993664, 98.956627838640, 98.956627838640)):    # float như trước khi sửa
+        tm.record_direct_spend(a, "inference-session direct m", "0x" + f"{100 + i:064x}")
+    exact = Decimal("296.906919677279991888")                                # raw chain chia 1e18
+    for k in range(5):
+        r = tm.confirm_gateway_attribution(exact, read_at=NOW + k)
+        assert r["outcome"] in ("no_change", "confirmed") and r["outcome"] != "low_reading"
+    led = tm.load_ledger()
+    assert led["gateway_unattributed"]["FLOP"] == "19.5" and not led.get("gateway_chain_low", {}).get("FLOP")
+    assert tm.direct_epoch_done() > 0                                         # kỳ không bị mở lại
+
+
+def test_real_low_readings_still_detect_a_reset():
+    tm.credit("1000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{200:064x}")
+    tm.confirm_gateway_attribution("100", read_at=NOW)
+    outs = [tm.confirm_gateway_attribution("5", read_at=NOW + k)["outcome"] for k in range(1, 4)]
+    assert outs[:2] == ["low_reading", "low_reading"] and tm.direct_epoch_done() == Decimal("0")
+
+
+def test_unknown_outcome_holds_its_escrow_for_the_gateway_gate():
+    import flop_direct
+    st = {flop_direct.KEY: {}}
+    flop_direct._mark_orphan(st[flop_direct.KEY], NOW, "testnet", "99.5")
+    assert st[flop_direct.KEY]["orphan_since"] == NOW
+    assert ac.direct_unbooked(st) == pytest.approx(99.5)
+    flop_direct._mark_orphan(st[flop_direct.KEY], NOW + 10, "devnet", "50")   # mạng khác: không tính
+    assert ac.direct_unbooked(st) == pytest.approx(99.5)
+    view = flop_direct.durable_view(st[flop_direct.KEY])
+    assert view["unknown_escrow"][0][2] == "99.5"                             # sao lưu KV
+
+
+# --- chain reset phát hiện trễ: chi trực tiếp trong lúc chờ thuộc kỳ MỚI ---------------------------------------------
+
+def test_direct_spend_booked_while_detecting_a_reset_moves_to_the_new_epoch():
+    tm.credit("5000")
+    tm.record_direct_spend("500", "inference-session direct m", "0x" + f"{300:064x}")
+    tm.confirm_gateway_attribution("500", read_at=NOW)                      # đọc nhất quán, kỳ cũ = 500
+    tm.record_gateway_spend("20", "inference-session gateway m", "g-x")    # gateway (broker) chờ
+    # chain reset: chain mới ghi 0, rồi các phiên trực tiếp MỚI được ghi sổ trong 3 lần đọc thấp
+    totals = []
+    for k in range(3):
+        tm.record_direct_spend("99", "inference-session direct m", "0x" + f"{400 + k:064x}")
+        totals.append(99 * (k + 1))
+        tm.confirm_gateway_attribution(str(totals[-1]), read_at=NOW + k + 1)
+    led = tm.load_ledger()
+    assert tm.direct_epoch_done() == Decimal("297") and led["gateway_epoch_done"]["FLOP"] == "297"
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20")        # KHÔNG xác nhận nhầm gateway
+
+
+def test_consistent_reading_clears_the_since_ok_counter():
+    tm.credit("1000")
+    tm.record_direct_spend("10", "inference-session direct m", "0x" + f"{500:064x}")
+    assert tm.load_ledger()["direct_since_ok"]["FLOP"] == "10"
+    tm.confirm_gateway_attribution("10", read_at=NOW)
+    assert tm.load_ledger()["direct_since_ok"]["FLOP"] == "0"
+
+
+def test_genesis_change_reset_also_carries_direct_booked_since_the_last_good_read():
+    tm.credit("1000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{600:064x}")
+    tm.confirm_gateway_attribution("100", chain_id="0xaa", read_at=NOW)
+    tm.record_gateway_spend("30", "inference-session gateway m", "g-y")
+    tm.record_direct_spend("40", "inference-session direct m", "0x" + f"{601:064x}")    # phiên đầu trên chain mới
+    tm.confirm_gateway_attribution("40", chain_id="0xbb", read_at=NOW + 1)            # genesis đổi: reset ngay
+    assert tm.direct_epoch_done() == Decimal("40") and tm.gateway_attribution()["unattributed"] == Decimal("30")
+
+
+# --- M6: mở lại cổng / xác nhận chỉ khi có bằng chứng THEO KÊNH -------------------------------------------------------
+
+def test_probe_without_own_channel_evidence_keeps_the_gate_closed(monkeypatch, telegram):
+    _own_channels(monkeypatch, own=False)                                   # kênh thăm dò vẫn đứng tên broker
+    st, srv = _held(monkeypatch)
+    st[ac.FOREIGN_SEEN_KEY] = NOW - 100
+    _run_at(monkeypatch, st, NOW)
+    t = NOW + 6 * 3600
+    assert _run_at(monkeypatch, st, t) == "spent"
+    srv.receipts = [rc("probe", spend=0.05, created_at=t * 1000)]
+    _run_at(monkeypatch, st, t + 300)
+    st[flop_radar.KEY] = _chain_read(5 * 10 ** 16, at=t + 600)             # chain +0.05 cho ví — từ nguồn khác
+    ac.gateway_attribution_step(st, t + 600)
+    led = tm.load_ledger()
+    assert "gateway_written_off" not in led and ac.ATTRIB_PROBE_KEY in st
+    assert tm.gateway_attribution()["attributed"] == 0                      # không xác nhận theo tổng
+    assert ac.attribution_hold(st, t + 600) is not None
+
+
+def test_own_channel_evidence_is_recorded_from_receipt_lookups(monkeypatch, telegram):
+    _own_channels(monkeypatch)
+    st, srv = _held(monkeypatch)
+    srv.receipts = [rc("mine", created_at=NOW * 1000)]
+    _run_at(monkeypatch, st, NOW)
+    assert st[ac.OWN_SEEN_KEY] == NOW
