@@ -68,7 +68,7 @@ YP_ALERT_LINES = 5                   # số commit liệt kê trong một tin
 YP_FILES_SHOWN = 8                   # số file đổi liệt kê
 DEVNET_STATUS_URL = "https://docs.flop.network/docs/network-devnet"
 BASE_DEVNET_STATUS = "development"
-EXPLORERS = ("https://explorer.devnet.flop.network", "https://explorer.testnet.flop.network")
+EXPLORERS = ("https://explorer.devnet.flop.network", "https://testnet.flopscan.io")
 # CONTRIBUTOR = đã có commit trong repo. Yellowpaper chỉ do người của FLOP commit (2026-10-28: duy
 # nhất `sv`, người đồng bộ bản spec — GitHub hiện là CONTRIBUTOR, không phải MEMBER).
 MAINTAINER_ROLES = frozenset(("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"))
@@ -245,8 +245,11 @@ def parse_spent(text):
 
 
 def parse_balance(text):
-    """balance (int, đơn vị raw 1e18) của một ví trên explorer; None nếu hỏng."""
+    """balance (int, đơn vị raw 1e18) của một ví trên explorer; None nếu hỏng. FLOPScan (testnet) đôi khi trả
+    `"balance":"0","liveBalance":false` (số cũ trong cache, chain thật vẫn còn tiền) -> coi như KHÔNG đọc được."""
     d = _json(text)
+    if isinstance(d, dict) and d.get("liveBalance") is False:
+        return None
     v = d.get("balance") if isinstance(d, dict) else None
     try:
         return int(v) if isinstance(v, (str, int)) else None

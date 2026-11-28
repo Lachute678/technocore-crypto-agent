@@ -131,7 +131,7 @@ def test_fuzz(monkeypatch, tmp_path, seed, capsys):
 
     def get(url, params=None, **k):
         params = params or {}
-        if chain["down"] and "explorer" in url:
+        if chain["down"] and ("explorer" in url or "flopscan" in url):
             return R({"error": "bad gateway"}, 502)
         if url.endswith(f"/api/accounts/{addr}/inference-spend"):
             return R({"address": addr, "totalSpentRaw": str(chain["spent"])})
@@ -160,6 +160,9 @@ def test_fuzz(monkeypatch, tmp_path, seed, capsys):
     born, cur_run = {}, [0]
 
     def cli(cmd, envx, timeout):
+        if "--entrypoint" in cmd:                         # flop_recover.mjs: kênh mô phỏng chưa tới hạn hoàn
+            ids = [c for c in (envx or {}).get("FLOP_RECOVER_CHANNELS", "").split(",") if c]
+            return 0, "\n".join(json.dumps({"channel": c, "state": "open", "action": "wait"}) for c in ids), ""
         if "import" in cmd:
             return 0, json.dumps({"ok": True, "address": addr}), ""
         if "finalize" in cmd:

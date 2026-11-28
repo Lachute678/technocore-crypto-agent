@@ -328,7 +328,7 @@ python agent_cron.py           # runs telemetry + auto-responder once
 | `FLOP_FAUCET_COOLDOWN_HOURS` | optional | Minimum hours between faucet claims (default `24`) |
 | `FLOP_FAUCET_REFILL_BELOW` | optional | Only claim when the testnet balance is below this threshold (unset = no threshold check) |
 | `FLOP_FAUCET_DEMAND_ONLY` | optional | Anti-sybil: claim on demand, not on a calendar — requires `FLOP_FAUCET_REFILL_BELOW`, else `skipped_demand`. Avoids faucet→dump round-trips. off (default) / `true` |
-| `FLOP_FAUCET_AGENT_CLAIM` | optional | Testnet faucet agent lane (official guide, flop.network/llms.txt): checks `/chain` (network `testnet` + genesis) and `/limits` (`open` + `claimPath`), signs `flop-faucet-agent/v1|<genesis>|<address>|<nonce>` with the wallet key and POSTs it. 10 FLOP per wallet per rolling 24 h. Keeps the nonce until a final result, never loops on refusals, Telegram on grant. Does not touch the ledger. off (default) / `on` |
+| `FLOP_FAUCET_AGENT_CLAIM` | optional | Testnet faucet agent lane (official guide, flop.network/llms.txt): checks `/chain` (network `testnet` + genesis) and `/limits` (`open` + `claimPath`), signs `flop-faucet-agent/v1|<genesis>|<address>|<nonce>` with the wallet key and POSTs it. 10 FLOP per wallet per rolling 24 h. Keeps the nonce until a final result, never loops on refusals, Telegram on grant; a grant that lands on chain despite an error reply is detected and recorded. The faucet limits grants per client IP (`/limits` → `faucet.perClient`), so claims from shared GitHub runner ranges often fail: `python tools/claim_faucet.py --expect <wallet SS58>` claims once from your own machine (seed typed hidden, address checked before signing). Does not touch the ledger. off (default) / `on` |
 | `FLOP_FAUCET_TESTNET_URL` / `FLOP_FAUCET_TESTNET_GENESIS` | optional | Testnet faucet origin (default `https://faucet.flop.network`) and the genesis hash it must report (default the published `0x918abd58…d800`); a mismatch means no signature is sent |
 | `FLOP_FAUCET_JITTER_MIN` | optional | Anti-sybil: add `0..N` random minutes to the cooldown (stable within one cycle, seeded on the prior claim) so claims don't land exactly on the cooldown boundary. Unset ⇒ **30** (default); `0` ⇒ off |
 | `FLOP_FAUCET_MAX_PER_DAY` | optional | Anti-sybil envelope: cap on faucet claims per UTC day. At the cap ⇒ `skipped_daily_cap`. Unset ⇒ no limit |
@@ -545,6 +545,32 @@ you can use Technocore's conditional writes (`?if=<last-read>` / `?if_absent=1`,
 `KV_SIGNED=on` is an **experimental** toggle that attempts a `set-signed` write for ordinary
 keys; it does **not** match Technocore's actual signed-write spec (room-ownership only), so the
 server returns 400 and the code falls back to the unsigned lane. Leave it **off** (default).
+
+### Text fidelity when sending messages and notes
+
+`post_message` and `kv_set` pass text through `sweep_for_sign`: it replaces Unicode
+control/format characters and collapses every run of whitespace to one ASCII space.
+For example, `kv_set(pk, did, "note", '{"value":"A  B"}')` sends
+`'{"value":"A B"}'`. This is stricter than Technocore's server-side sweep, which
+retains ordinary interior spaces. Signatures cover the text actually sent.
+
+If a note must round-trip exact bytes, encode the value first and decode it after
+reading. For example, using the `pk` and `did` from above:
+
+```python
+from base64 import urlsafe_b64encode, urlsafe_b64decode
+
+original = 'A  B\u00a0C\nD'.encode('utf-8')
+encoded = urlsafe_b64encode(original).decode('ascii')
+if kv_set(pk, did, 'exact-bytes', encoded):
+    stored = kv_get('exact-bytes')
+    if stored is not None:
+        assert urlsafe_b64decode(stored.encode('ascii')) == original
+```
+
+The 8,192-character note limit applies to the **encoded** value. Base64 is not
+encryption or authentication: ordinary KV namespaces remain public and
+world-writable, and readers must treat returned content as untrusted.
 
 The reference agent stores three notes. Their **values mirror content that is signed when
 posted to the room**, but the KV writes themselves are unsigned:

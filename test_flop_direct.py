@@ -89,7 +89,7 @@ def step(state, cli, explorer=None, book=True, network="testnet", **kw):
     return fd.run_step(state, agent_key=KEY, now=kw.pop("now", NOW), prompt=kw.pop("prompt", "What is 2+2?"),
                        network=network, fetch_channel=lambda cid: explorer.get(cid),
                        book_fn=book_fn if book else None, runner=cli, alert=alerts.append,
-                       log=lambda m: None, offers_fn=offers_fn, **kw)
+                       log=kw.pop("log", lambda m: None), offers_fn=offers_fn, **kw)
 
 
 # --- cấu hình & chốt chặn -------------------------------------------------------------------
@@ -123,6 +123,24 @@ def test_force_needs_the_explicit_opt_in(monkeypatch):
     cli = CLI()
     assert step({}, cli)["outcome"] == "opened"
     assert cli.sessions()[0]["cmd"][-1] == "force"
+
+
+def test_force_passes_a_channel_lifetime_the_cli_outlives(monkeypatch):
+    # CLI 0.10.x mặc định kênh 1200 s, dài hơn ngân sách bước direct: đường force luôn truyền --max-duration (mặc định 600)
+    # và CLI được chờ quá thời hạn đó + biên, không thì bị giết trước khi SDK kịp thu hồi escrow của kênh hỏng.
+    monkeypatch.setenv("FLOP_DIRECT_VIA", "force")
+    monkeypatch.setenv("FLOP_DIRECT_ALLOW_FORCE", "on")
+    cli = CLI()
+    assert step({}, cli)["outcome"] == "opened"
+    run = cli.sessions()[0]
+    assert run["cmd"][run["cmd"].index("--max-duration") + 1] == str(fd.DEFAULT_FORCE_MAX_DURATION_SEC)
+    assert run["timeout"] >= fd.DEFAULT_FORCE_MAX_DURATION_SEC + fd.MAXDUR_MARGIN_SEC
+    monkeypatch.setenv("FLOP_DIRECT_MAX_DURATION_SEC", "900")
+    cli = CLI()
+    step({}, cli)
+    assert cli.sessions()[0]["cmd"][cli.sessions()[0]["cmd"].index("--max-duration") + 1] == "900"
+    monkeypatch.setenv("FLOP_DIRECT_MAX_DURATION_SEC", "60")
+    assert any("FLOP_DIRECT_MAX_DURATION_SEC" in e for e in fd.config()[1])
 
 
 def test_buying_from_the_agents_own_wallet_is_refused(monkeypatch):
@@ -312,6 +330,91 @@ def test_failure_with_a_channel_is_tracked_until_resolved():
     r = step(st, CLI(session=(1, "", err)))
     assert r["outcome"] == "error" and st[fd.KEY]["pending"][0]["channel"] == CH2
     assert mst(st)["wait_until"] == NOW + fd.ERROR_BACKOFF_SEC
+
+
+def test_rpc_unreachable_backs_off_globally_and_briefly_without_blocking_the_miner():
+    err = json.dumps({"ok": False, "code": "RPC_UNREACHABLE",
+                      "message": "RPC unreachable: could not connect to wss://testnet.flop.network: RPC unreachable: "
+                                 "connection to wss://testnet.flop.network timed out after 10 seconds"})
+    st = {}
+    r = step(st, CLI(session=(1, "", err)))
+    assert r["outcome"] == "rpc_down"
+    assert not mst(st).get("wait_until") and not mst(st).get("unknown_until")
+    assert st[fd.KEY]["wait_until"] == NOW + fd.RPC_BACKOFF_SEC and fd.RPC_BACKOFF_SEC < fd.ERROR_BACKOFF_SEC
+    assert not st[fd.KEY].get("pending") and not st[fd.KEY].get("unknown_escrow")
+    assert float(st[fd.KEY]["day"]["escrow"]) == 0                     # từ chối rõ: trả lại trần ngày
+    cli = CLI()
+    assert step(st, cli, now=NOW + 60)["outcome"] == "backoff" and cli.calls == []
+    assert step(st, CLI(), now=NOW + fd.RPC_BACKOFF_SEC + 1)["outcome"] == "opened"
+
+
+def test_rpc_unreachable_stops_the_run_before_other_miners(monkeypatch, three_miners):
+    monkeypatch.setenv("FLOP_DIRECT_MAX_PER_RUN", "3")
+    err = json.dumps({"ok": False, "code": "RPC_UNREACHABLE", "message": "RPC unreachable: could not connect to "
+                                                                       "wss://testnet.flop.network"})
+    cli, st = MultiCLI(by_miner={k: (1, "", err) for k in (MINER, M2, M3)}), {}
+    r = step(st, cli, offers_fn=_offers_for(MINER, M2, M3))
+    assert r["outcome"] == "rpc_down" and len(cli.miners()) == 1
+    ms = st[fd.KEY]["miners"]
+    assert all(not (ms.get(fd._mkey(k)) or {}).get("wait_until") for k in (MINER, M2, M3))
+
+
+def test_cli_gets_a_longer_rpc_connect_bound(monkeypatch):
+    cli = CLI()
+    step({}, cli)
+    cmd = cli.sessions()[0]["cmd"]
+    assert cmd[cmd.index("--rpc-timeout") + 1] == str(fd.DEFAULT_RPC_TIMEOUT_MS)
+    assert cmd.index("--rpc-timeout") < cmd.index("session")              # tuỳ chọn toàn cục: trước lệnh con
+    monkeypatch.setenv("FLOP_DIRECT_RPC_TIMEOUT_MS", "999999")
+    assert fd.rpc_timeout_ms() == fd.MAX_RPC_TIMEOUT_MS
+    monkeypatch.setenv("FLOP_DIRECT_RPC_TIMEOUT_MS", "5")
+    assert fd.rpc_timeout_ms() == fd.MIN_RPC_TIMEOUT_MS
+    monkeypatch.setenv("FLOP_DIRECT_RPC_TIMEOUT_MS", "abc")
+    assert fd.rpc_timeout_ms() == fd.DEFAULT_RPC_TIMEOUT_MS
+
+
+def _rpc(ts_ms, syncing=False, fail=None):
+    def call(method, params):
+        if fail == method:
+            raise ConnectionError("down")
+        if method == "chain_getFinalizedHead":
+            return "0x" + "ab" * 32
+        if method == "state_getStorage":
+            assert params[0] == fd._TIMESTAMP_NOW_KEY and params[1] == "0x" + "ab" * 32
+            return "0x" + int(ts_ms).to_bytes(8, "little").hex()
+        if method == "system_health":
+            return {"isSyncing": syncing, "peers": 16}
+        raise AssertionError(method)
+    return call
+
+
+def test_rpc_freshness_matches_the_sdk_sign_bound():
+    now = 1_800_000_000_000
+    assert fd.rpc_not_ready_reason(_rpc(now - 6_000), lambda: now) == ""
+    why = fd.rpc_not_ready_reason(_rpc(now - 3_686_000, syncing=True), lambda: now)
+    assert "3686s" in why and "đồng bộ" in why
+    assert fd.rpc_not_ready_reason(_rpc(now + 60_000), lambda: now)           # đồng hồ lệch về tương lai cũng từ chối
+    assert "không đọc được" in fd.rpc_not_ready_reason(_rpc(now, fail="state_getStorage"), lambda: now)
+
+
+def test_stale_rpc_skips_the_session_without_holds_or_alerts():
+    st, alerts, cli = {}, [], CLI()
+    r = step(st, cli, alerts=alerts, rpc_ready_fn=lambda: "block finalized của RPC lệch 3686s")
+    assert r["outcome"] == "rpc_down" and cli.sessions() == [] and alerts == []
+    g = st[fd.KEY]
+    assert g["wait_until"] == NOW + fd.RPC_BACKOFF_SEC
+    assert not mst(st).get("unknown_until") and not mst(st).get("wait_until")
+    assert float((g.get("day") or {}).get("escrow") or 0) == 0 and not g.get("pending")
+    calls = []
+    r = step(st, CLI(), now=NOW + fd.RPC_BACKOFF_SEC + 1, rpc_ready_fn=lambda: calls.append(1) or "")
+    assert r["outcome"] == "opened" and calls == [1]
+
+
+def test_rpc_check_error_is_treated_as_not_ready():
+    def boom():
+        raise TimeoutError
+    st, cli = {}, CLI()
+    assert step(st, cli, rpc_ready_fn=boom)["outcome"] == "rpc_down" and cli.sessions() == []
 
 
 def test_no_offer_backs_off_without_a_channel():
@@ -522,9 +625,39 @@ def test_agent_step_wires_explorer_prompts_and_booking(monkeypatch):
     assert "q1" in cli.sessions()[0]["cmd"][cli.sessions()[0]["cmd"].index("--prompt") + 1]
     status = ac.direct_session_step(st, KEY, NOW + 300)
     assert status.startswith("pending") or status.startswith("opened")
-    assert any(u.endswith(f"/api/compute-channels/{CH}") and "explorer.testnet.flop.network" in u for u in seen)
+    assert any(u.endswith(f"/api/compute-channels/{CH}") and "testnet.flopscan.io" in u for u in seen)
     assert any("/api/session-offers?" in u and f"miner={MINER}" in u for u in seen)
     assert tm.load_ledger()["session_cumulative"]["FLOP"] == "0.021"
+
+
+def test_agent_step_skips_sessions_while_the_rpc_is_stale(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "q1|q2")
+    cli = CLI()
+    monkeypatch.setattr(fd, "_run", cli)
+    monkeypatch.setattr(ac, "kv_set", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "_telegram_send", lambda m: True)
+    seen = []
+
+    def stale(call):
+        seen.append(call)
+        return "block finalized của RPC lệch 3686s"
+
+    monkeypatch.setattr(ac, "direct_rpc_not_ready", stale)
+
+    class _R:
+        status_code = 200
+
+        def json(self):
+            return {"data": [offer()], "pagination": {"total": 1}}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(ac.requests, "get", lambda url, **k: _R())
+    st = {}
+    status = ac.direct_session_step(st, KEY, NOW)
+    assert status.startswith("rpc_down") and cli.sessions() == [] and len(seen) == 1
+    assert st[fd.KEY]["wait_until"] == NOW + fd.RPC_BACKOFF_SEC
 
 
 def test_agent_step_is_off_by_default(monkeypatch):
@@ -587,6 +720,7 @@ def test_several_sessions_per_run_with_one_keystore_and_distinct_prompts(monkeyp
 
 def test_sessions_stop_when_the_run_budget_runs_out(monkeypatch):
     monkeypatch.setenv("FLOP_DIRECT_MAX_PER_RUN", "10")
+    monkeypatch.setenv("FLOP_DIRECT_RPC_TIMEOUT_MS", "10000")              # +10 s chờ kết nối RPC mỗi phiên
     monkeypatch.setenv("FLOP_DIRECT_TIMEOUT_SEC", "100")
     clock = [0.0]
     cli = MultiCLI(clock=clock, cost=100)
@@ -1198,9 +1332,9 @@ def _dur_offer(seconds, **kw):
 
 def test_cli_gets_the_indexer_url_for_offer_discovery():
     cli = CLI()
-    step({}, cli, indexer_url="https://explorer.testnet.flop.network/")
+    step({}, cli, indexer_url="https://testnet.flopscan.io/")
     run = cli.sessions()[0]
-    assert run["env"]["FLOP_INDEXER_URL"] == "https://explorer.testnet.flop.network"
+    assert run["env"]["FLOP_INDEXER_URL"] == "https://testnet.flopscan.io"
     assert run["cmd"][run["cmd"].index("FLOP_INDEXER_URL") - 1] == "-e"              # chỉ TÊN trên dòng lệnh
     cli2 = CLI()
     step({}, cli2)
@@ -1210,16 +1344,16 @@ def test_cli_gets_the_indexer_url_for_offer_discovery():
 def test_session_timeout_covers_the_channel_max_duration():
     cli = CLI()
     step({}, cli, offers=[_dur_offer(600)])
-    assert cli.sessions()[0]["timeout"] == 600 + fd.MAXDUR_MARGIN_SEC
+    assert cli.sessions()[0]["timeout"] == 600 + fd.MAXDUR_MARGIN_SEC + fd.DEFAULT_RPC_TIMEOUT_MS // 1000
     cli = CLI()
     step({}, cli, offers=[_dur_offer(120)])
-    assert cli.sessions()[0]["timeout"] == fd.DEFAULT_TIMEOUT_SEC                    # không thấp hơn cấu hình
+    assert cli.sessions()[0]["timeout"] == fd.DEFAULT_TIMEOUT_SEC + fd.DEFAULT_RPC_TIMEOUT_MS // 1000                  # không thấp hơn cấu hình
 
 
 def test_a_session_that_cannot_outlive_its_channel_is_not_started():
     cli = CLI()
     r = step({}, cli, offers=[_dur_offer(900)], deadline=NOW + 900.0, clock=lambda: float(NOW))
-    assert r["outcome"] == "run_budget" and cli.sessions() == [] and str(900 + fd.MAXDUR_MARGIN_SEC) in r["reason"]
+    assert r["outcome"] == "run_budget" and cli.sessions() == [] and str(900 + fd.MAXDUR_MARGIN_SEC + fd.DEFAULT_RPC_TIMEOUT_MS // 1000) in r["reason"]
 
 
 def test_a_long_offer_is_skipped_for_a_miner_that_fits(monkeypatch, three_miners):
@@ -1239,7 +1373,7 @@ def test_sizing_uses_the_shortest_offer_duration(monkeypatch):
     step({}, cli, prompt=LONG, offers=[_dur_offer(600), _dur_offer(60)], miner_cap_fn=lambda m: 130.0)
     run = cli.sessions()[0]
     assert int(run["cmd"][run["cmd"].index("--max-tokens") + 1]) == int(130 * 60 / 28.0) - len(LONG) // 4
-    assert run["timeout"] == 600 + fd.MAXDUR_MARGIN_SEC                                 # chờ theo offer DÀI nhất
+    assert run["timeout"] == 600 + fd.MAXDUR_MARGIN_SEC + fd.DEFAULT_RPC_TIMEOUT_MS // 1000                                 # chờ theo offer DÀI nhất
 
 
 def test_escrow_fits_every_precision_the_miner_offers():
@@ -1379,7 +1513,7 @@ def test_agent_filters_expired_offers_and_passes_the_indexer(monkeypatch):
     assert offer_q["minExpiry"] == "5001"
     run = cli.sessions()[0]
     assert Decimal(run["cmd"][run["cmd"].index("--max-flop") + 1]) >= Decimal("0.05")  # không theo offer hết hạn
-    assert run["env"]["FLOP_INDEXER_URL"] == "https://explorer.testnet.flop.network"
+    assert run["env"]["FLOP_INDEXER_URL"] == "https://testnet.flopscan.io"
 
 
 # --- audit vòng 3: settle cưỡng bức, đối soát khi tắt, đổi mạng -----------------------------------------------------
@@ -1600,7 +1734,7 @@ def test_agent_alerts_when_direct_buying_stalls(monkeypatch):
     st = {}
     for i in range(6):
         ac._DIRECT_LAST = ({"outcome": "low_balance", "settled": 0, "reason": "hết FLOP", "balance": 0.2},
-                           "testnet", "https://explorer.testnet.flop.network")
+                           "testnet", "https://testnet.flopscan.io")
         ac.direct_watchdog_step(st, NOW + i * 300)
     assert len(sent) == 1 and "MUA TRỰC TIẾP (testnet)" in sent[0] and ac._DIRECT_LAST is None
     ac.direct_watchdog_step(st, NOW + 9999)                                 # lượt không chạy bước direct: bỏ qua
@@ -2420,3 +2554,507 @@ def test_done_channel_the_ledger_lost_is_booked_again():
          explorer={CH: paid()}, own_channels_fn=lambda a: [_row(CH, opened=NOW - 7200)],
          booked_fn=lambda cid: tm.direct_booked(cid))
     assert sum(1 for e in tm.load_ledger().get("entries", []) if e.get("ref") == CH) == 1   # không ghi lần hai
+
+
+def test_agent_ignores_a_non_live_explorer_balance(monkeypatch):
+    # FLOPScan trả "balance":"0","liveBalance":false khi chỉ có số trong cache: KHÔNG được đọc thành ví rỗng (low_balance).
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "Explain optimistic versus pessimistic locking in distributed databases.")
+    monkeypatch.setenv("FLOP_DIRECT_VIA", "force")
+    monkeypatch.setenv("FLOP_DIRECT_ALLOW_FORCE", "on")
+    monkeypatch.setenv("FLOP_DIRECT_MAX_FLOP", "0.005")
+    cli = CLI()
+    monkeypatch.setattr(fd, "_run", cli)
+
+    class _R:
+        status_code = 200
+        text = ""
+
+        def __init__(self, data):
+            self._d = data
+
+        def json(self):
+            return self._d
+
+        def raise_for_status(self):
+            return None
+
+    def get(url, **k):
+        if "/api/accounts/" in url:
+            return _R({"balance": "0", "nonce": 0, "liveBalance": False})
+        return _R({})
+
+    monkeypatch.setattr(ac.requests, "get", get)
+    monkeypatch.setattr(ac, "kv_set", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "_telegram_send", lambda m: True)
+    assert ac.direct_session_step({}, KEY, NOW) == "opened"
+
+
+# --- khoản giữ "không rõ kết quả" gỡ sớm theo nonce ví (testnet 27/11) ---------------------------------------------
+
+_UNKNOWN = (1, "", json.dumps({"ok": False, "code": "SUBMISSION_UNKNOWN",
+                               "message": "open submission outcome unknown; retain the original intent and reconcile "
+                                          "before retrying"}))
+
+
+def _force(monkeypatch):
+    monkeypatch.setenv("FLOP_DIRECT_VIA", "force")
+    monkeypatch.setenv("FLOP_DIRECT_ALLOW_FORCE", "on")
+    monkeypatch.setenv("FLOP_DIRECT_MAX_FLOP", "0.5")
+    monkeypatch.setenv("FLOP_DIRECT_MAX_PER_DAY", "9")
+    monkeypatch.setenv("FLOP_DIRECT_MAX_PER_RUN", "3")
+
+
+def test_outcome_unknown_stops_the_run_and_holds_only_that_miner(monkeypatch, three_miners):
+    _force(monkeypatch)
+    first = fd.config()[0]["miners"][0]["miner"]
+    cli, st = MultiCLI(by_miner={first: _UNKNOWN}), {}
+    r = step(st, cli, nonce_fn=lambda a: 4)
+    assert r["outcome"] == "unknown_outcome" and cli.miners() == [first]     # không thử miner kế: lỗi RPC/chain chung
+    h = mst(st, first)
+    assert h["unknown_until"] == NOW + fd.UNKNOWN_HOLD_SEC and h["unknown_nonce"] == 4
+    assert h["unknown_escrow"] == "0.5" and st[fd.KEY]["day"]["escrow"] == 0.5
+    others = [k for k in st[fd.KEY].get("miners", {}) if k != fd._mkey(first)]
+    assert all(not st[fd.KEY]["miners"][k].get("unknown_until") for k in others)
+
+
+def test_unchanged_nonce_releases_the_hold_and_the_day_escrow(monkeypatch, three_miners):
+    _force(monkeypatch)
+    first = fd.config()[0]["miners"][0]["miner"]
+    st = {}
+    step(st, MultiCLI(by_miner={first: _UNKNOWN}), nonce_fn=lambda a: 4)
+    assert st[fd.KEY]["unknown_escrow"]
+    cli = MultiCLI()                                       # chưa đủ NONCE_RELEASE_SEC: vẫn giữ miner đó
+    step(st, cli, nonce_fn=lambda a: 4, now=NOW + 300)
+    assert first not in cli.miners() and mst(st, first).get("unknown_until")
+    logs = []
+    cli = MultiCLI()
+    before = st[fd.KEY]["day"]["escrow"]
+    r = fd.run_step(st, agent_key=KEY, now=NOW + fd.NONCE_RELEASE_SEC + 10, prompt="What is 2+2?", network="testnet",
+                    fetch_channel=lambda cid: None, runner=cli, alert=lambda m: None, log=logs.append,
+                    nonce_fn=lambda a: 4)
+    assert not mst(st, first).get("unknown_until") and "unknown_nonce" not in mst(st, first)
+    assert not any(len(h) >= 4 and fd._mkey(h[3]) == fd._mkey(first) for h in st[fd.KEY].get("unknown_escrow") or [])
+    assert any("gỡ khoản giữ" in x for x in logs) and r["opened"] >= 1
+    assert first in cli.miners()
+    # trần ngày: 0.5 của phiên không gửi được đã trả lại, cộng phần của các phiên mới mở
+    assert st[fd.KEY]["day"]["escrow"] == pytest.approx(before - 0.5 + 0.5 * r["opened"])
+
+
+@pytest.mark.parametrize("later", [5, None])
+def test_advanced_or_unreadable_nonce_keeps_the_hold(monkeypatch, three_miners, later):
+    _force(monkeypatch)
+    first = fd.config()[0]["miners"][0]["miner"]
+    st = {}
+    step(st, MultiCLI(by_miner={first: _UNKNOWN}), nonce_fn=lambda a: 4)
+    cli = MultiCLI()
+    step(st, cli, nonce_fn=lambda a: later, now=NOW + fd.NONCE_RELEASE_SEC + 10)
+    assert first not in cli.miners() and mst(st, first)["unknown_until"] == NOW + fd.UNKNOWN_HOLD_SEC
+    assert st[fd.KEY]["unknown_escrow"]
+
+
+def test_no_nonce_reader_keeps_the_old_six_hour_hold(monkeypatch, three_miners):
+    _force(monkeypatch)
+    first = fd.config()[0]["miners"][0]["miner"]
+    st = {}
+    step(st, MultiCLI(by_miner={first: _UNKNOWN}))
+    assert "unknown_nonce" not in mst(st, first)
+    cli = MultiCLI()
+    step(st, cli, now=NOW + fd.NONCE_RELEASE_SEC + 10)
+    assert first not in cli.miners()
+
+
+def test_an_interrupted_attempt_is_released_by_nonce_too(monkeypatch):
+    _force(monkeypatch)
+    st = {fd.KEY: {"attempt": {"ts": NOW, "network": "testnet", "miner": MINER, "escrow": "0.5", "nonce": 7},
+                   "day": {"day": __import__("time").strftime("%Y-%m-%d", __import__("time").gmtime(NOW)),
+                           "escrow": 0.5}}}
+    cli = MultiCLI()
+    step(st, cli, nonce_fn=lambda a: 7, now=NOW + 60)       # lượt sau ngay: giữ (chưa đủ thời gian)
+    assert MINER not in cli.miners() and mst(st)["unknown_nonce"] == 7
+    cli = MultiCLI()
+    step(st, cli, nonce_fn=lambda a: 7, now=NOW + fd.NONCE_RELEASE_SEC + 5)
+    assert cli.miners() and set(cli.miners()) == {MINER} and not mst(st).get("unknown_until")
+
+
+def test_hold_nonce_survives_the_kv_backup():
+    g = {"miners": {"k": {"unknown_until": 9, "unknown_nonce": 4, "unknown_since": 1, "unknown_escrow": "0.5",
+                          "unknown_day": "2026-11-27"}}}
+    assert fd.durable_view(g)["miners"]["k"]["unknown_nonce"] == 4
+
+
+# --- FLOP_DIRECT_FORGET: operator bỏ kênh lỗi "ma" (explorer 404) --------------------------------------------------
+
+def _ghost_state(day_escrow=1.02):
+    import time as _t
+    ts = NOW - 2700
+    ghost = "0x60fbb0a36138ef4e5dfd7e8bd538316981bfdbdea706a9f16f3a51b03d8586c9"
+    return ghost, {fd.KEY: {
+        "day": {"day": _t.strftime("%Y-%m-%d", _t.gmtime(NOW)), "escrow": day_escrow},
+        "miners": {fd._mkey(MINER): {"unknown_until": ts + fd.UNKNOWN_HOLD_SEC, "cap": 50.0}},
+        "pending": [{"channel": ghost, "ts": ts, "network": "testnet", "miner": MINER, "max_flop": "0.5",
+                     "error": "open submission outcome unknown; retain the original intent "}],
+        "unknown_escrow": [[ts, "testnet", "0.5", MINER, ts - 60, ts + 840]], "orphan_since": ts, "orphan_last": ts}}
+
+
+def test_forget_drops_a_ghost_channel_and_unblocks_its_miner(monkeypatch):
+    ghost, st = _ghost_state()
+    monkeypatch.setenv("FLOP_DIRECT_FORGET", ghost[:14] + ", 0xzz")
+    cli = MultiCLI()
+    r = step(st, cli, explorer={})                      # explorer: kênh không có (404 -> None)
+    assert not any(p.get("channel") == ghost for p in st[fd.KEY]["pending"])
+    assert MINER in cli.miners() and r.get("forgotten")
+    assert not st[fd.KEY].get("unknown_escrow")
+    assert st[fd.KEY]["day"]["escrow"] == pytest.approx(1.02 - 0.5 + 0.01 * r["opened"], abs=0.05)
+
+
+def test_forget_keeps_a_channel_the_explorer_knows(monkeypatch):
+    ghost, st = _ghost_state()
+    monkeypatch.setenv("FLOP_DIRECT_FORGET", ghost)
+    info = {"agent": ADDR, "status": "open", "paymentStatus": "LOCKED", "observationHead": "finalized"}
+    cli = MultiCLI()
+    step(st, cli, explorer={ghost: info})
+    assert any(p.get("channel") == ghost for p in st[fd.KEY]["pending"]) and MINER not in cli.miners()
+
+
+def test_forget_ignores_short_prefixes_and_healthy_channels(monkeypatch):
+    ghost, st = _ghost_state()
+    monkeypatch.setenv("FLOP_DIRECT_FORGET", "0x60fb")          # < 12 hex: bỏ qua
+    cli = MultiCLI()
+    step(st, cli, explorer={})
+    assert any(p.get("channel") == ghost for p in st[fd.KEY]["pending"]) and MINER not in cli.miners()
+
+
+# --- force-open hết hạn: explorer 404 nhưng ví đã expireForceOpen -------------------------------
+
+def _expire_tx(cid, method="expireForceOpen", success=True, section="computeChannel"):
+    return {"method": method, "section": section, "sender": ADDR, "params": [cid], "success": success}
+
+
+def test_refunded_channel_ids_only_successful_own_refund_calls():
+    txs = [_expire_tx(CH), _expire_tx(CH2, success=False), _expire_tx("0x" + "ee" * 32, method="forceOpen"),
+           _expire_tx("0x" + "ff" * 32, method="timeout"), _expire_tx("0x12", method="timeout"),
+           _expire_tx("0x" + "11" * 32, section="balances"), "junk", {"method": "timeout", "success": True}]
+    assert fd.refunded_channel_ids(txs) == {CH, "0x" + "ff" * 32}
+    assert fd.refunded_channel_ids(None) == set()
+
+
+def _failed_ack(st, logs=None):
+    err = json.dumps({"ok": False, "message": "miner acknowledgement timed out", "channel": CH2})
+    step(st, CLI(session=(1, "", err)), log=(logs.append if logs is not None else (lambda m: None)))
+    st[fd.KEY]["miners"][fd._mkey(MINER)]["wait_until"] = 0        # bỏ nghỉ 1 giờ: chỉ xét chặn do kênh lỗi
+    return st
+
+
+def test_expired_force_open_frees_the_miner_next_run():
+    logs = []
+    st = _failed_ack({}, logs)
+    assert any("thất bại" in m and "acknowledgement" in m and CH2[:12] in m.lower() for m in logs)
+    held = st[fd.KEY]["day"]["escrow"]
+    assert held > 0
+    cli = CLI()
+    r = step(st, cli, now=NOW + 900, own_txs_fn=lambda a: [_expire_tx(CH2)])
+    assert r["opened"] == 1 and len(cli.sessions()) == 1          # miner được dùng lại ngay, không chờ 48 giờ
+    assert not any(p.get("error") for p in st[fd.KEY]["pending"])
+    assert st[fd.KEY]["stats"]["refunded"] == 1
+
+
+def test_errored_channel_without_refund_tx_still_blocks():
+    st = _failed_ack({})
+    cli = CLI()
+    r = step(st, cli, now=NOW + 900, own_txs_fn=lambda a: [_expire_tx(CH2, success=False)])
+    assert r["outcome"] == "pending" and cli.sessions() == []
+
+
+def test_wallet_tx_read_error_keeps_the_block():
+    st = _failed_ack({})
+
+    def boom(a):
+        raise RuntimeError("explorer down")
+    cli = CLI()
+    r = step(st, cli, now=NOW + 900, own_txs_fn=boom)
+    assert r["outcome"] == "pending" and cli.sessions() == []
+
+
+# --- sức khoẻ miner (FLOP_DIRECT_HEALTH) -----------------------------------------------------------
+
+def _hch(ago, status="PAID"):
+    return {"openedAt": (NOW - ago) * 1000, "paymentStatus": status, "agent": OTHER}
+
+
+def test_miner_health_labels():
+    assert fd.miner_health([], NOW) == ("new", 0, None)
+    assert fd.miner_health([_hch(600), _hch(900), _hch(1200, "REFUNDED")], NOW) == ("ok", 2, NOW - 600)
+    old = fd.HEALTH_STALE_SEC + 60
+    assert fd.miner_health([_hch(300, "LOCKED"), _hch(old)], NOW) == ("stale", 0, NOW - old)
+    assert fd.miner_health([_hch(300, "REFUNDED")], NOW)[0] == "stale"
+    assert fd.miner_health(["junk", {"openedAt": "x"}], NOW)[0] == "new"
+
+
+def _health_fn(table):
+    return lambda miner: table.get(miner, [])
+
+
+def test_paying_miner_is_tried_first(monkeypatch, three_miners):
+    stale = [_hch(fd.HEALTH_STALE_SEC + 600)]
+    table = {MINER: stale, M2: [_hch(fd.HEALTH_FRESH_SEC + 600)], M3: [_hch(300), _hch(700), _hch(800)]}
+    cli = MultiCLI()
+    r = step({}, cli, offers_fn=_offers_for(MINER, M2, M3), miner_channels_fn=_health_fn(table))
+    assert r["opened"] == 1 and cli.miners() == [M3]
+
+
+def test_most_recently_paying_miner_beats_a_busier_one_that_just_stopped(monkeypatch, three_miners):
+    # M2: nhiều PAID nhưng PAID cuối đã 2 giờ trước (vừa hỏng); M3: ít PAID nhưng vừa trả 5 phút trước.
+    busy_dead = [_hch(7200 + 60 * i) for i in range(20)]
+    table = {MINER: [_hch(fd.HEALTH_STALE_SEC + 600)], M2: busy_dead, M3: [_hch(300), _hch(900)]}
+    cli = MultiCLI()
+    step({}, cli, offers_fn=_offers_for(MINER, M2, M3), miner_channels_fn=_health_fn(table))
+    assert cli.miners() == [M3]
+
+
+def test_stale_miner_is_probed_at_most_every_probe_window(monkeypatch):
+    table = {MINER: [_hch(fd.HEALTH_STALE_SEC + 600)]}
+    logs, st = [], {}
+    cli = CLI()
+    step(st, cli, miner_channels_fn=_health_fn(table), log=logs.append)
+    assert len(cli.sessions()) == 1 and any("thăm dò" in m for m in logs)       # thăm dò một lần
+    cli2 = CLI()
+    r = step(st, cli2, now=NOW + 1800, miner_channels_fn=_health_fn(table))
+    assert r["outcome"] == "stale" and cli2.sessions() == []
+    cli3 = CLI()
+    step(st, cli3, now=NOW + fd.STALE_PROBE_SEC + 60, miner_channels_fn=_health_fn(table))
+    assert len(cli3.sessions()) == 1
+
+
+def test_new_miner_without_history_is_not_skipped():
+    cli = CLI()
+    assert step({}, cli, miner_channels_fn=lambda m: [])["opened"] == 1
+
+
+def test_health_read_error_or_off_keeps_old_behaviour(monkeypatch):
+    def boom(m):
+        raise RuntimeError("explorer down")
+    cli = CLI()
+    assert step({}, cli, miner_channels_fn=boom)["opened"] == 1
+    monkeypatch.setenv("FLOP_DIRECT_HEALTH", "off")
+    cli2 = CLI()
+    assert step({}, cli2, miner_channels_fn=_health_fn({MINER: [_hch(fd.HEALTH_STALE_SEC + 600)]}))["opened"] == 1
+
+
+def test_repeated_failures_back_off_exponentially():
+    err = (1, "", json.dumps({"ok": False, "code": "SESSION_FAILED", "message": "no answer"}))
+    st, t = {}, NOW
+    waits = []
+    for _ in range(5):
+        step(st, CLI(session=err), now=t)
+        w = mst(st)["wait_until"] - t
+        waits.append(w)
+        t += w + 1
+    assert waits == [3600, 7200, 14400, 28800, 28800]
+    step(st, CLI(), now=t)                                                    # thành công -> hết chuỗi lỗi
+    assert "fail_streak" not in mst(st)
+
+
+def test_stale_probe_is_not_spent_when_the_run_stops_before_the_session():
+    table = {MINER: [_hch(fd.HEALTH_STALE_SEC + 600)]}
+    st, cli = {}, CLI()
+    r = step(st, cli, miner_channels_fn=_health_fn(table), rpc_ready_fn=lambda: "RPC lệch 3000s")
+    assert r["outcome"] == "rpc_down" and cli.sessions() == []
+    assert "probe_at" not in mst(st)                                           # chưa thăm dò thật
+    cli2 = CLI()
+    step(st, cli2, now=NOW + fd.RPC_BACKOFF_SEC + 60, miner_channels_fn=_health_fn(table))
+    assert len(cli2.sessions()) == 1 and mst(st)["probe_at"] == NOW + fd.RPC_BACKOFF_SEC + 60
+
+
+# --- lấy lại escrow kênh kẹt (flop_recover.mjs) ------------------------------------------------------------------
+
+class RecoverCLI(CLI):
+    """CLI giả + script lấy lại escrow: lệnh có `--entrypoint node` trả các dòng JSON trong `recover`."""
+
+    def __init__(self, recover=None, **kw):
+        super().__init__(**kw)
+        self.recover = recover or {}
+        self.recover_calls = []
+
+    def __call__(self, cmd, env, timeout):
+        if "--entrypoint" in cmd:
+            self.recover_calls.append({"cmd": list(cmd), "env": dict(env)})
+            ids = env.get("FLOP_RECOVER_CHANNELS", "").split(",")
+            lines = [json.dumps({"channel": c, **self.recover[c]}) for c in ids if c in self.recover]
+            return 0, "\n".join(lines + [json.dumps({"done": True})]), ""
+        return super().__call__(cmd, env, timeout)
+
+
+def _locked(agent=ADDR):
+    return {"agent": agent, "status": "open", "paymentStatus": "LOCKED", "observationHead": "finalized"}
+
+
+def _settle_unknown(st):
+    err = json.dumps({"ok": False, "message": "cooperative settlement outcome unknown; inspect finalized history",
+                      "channel": CH2})
+    step(st, CLI(session=(1, "", err)))
+    assert mst(st)["unknown_until"] == NOW + fd.UNKNOWN_HOLD_SEC and st[fd.KEY]["pending"][0]["error"]
+    return st
+
+
+def test_recover_command_runs_node_in_the_pinned_image_without_secrets_on_argv():
+    cli = RecoverCLI(recover={CH: {"state": "open", "action": "timeout", "ok": True, "tx": "0xt1", "refunded": "1"}})
+    st = _settle_unknown({})
+    st[fd.KEY]["pending"][0]["channel"] = CH
+    st[fd.KEY]["pending"][0]["ts"] = NOW
+    step(st, cli, explorer={CH: _locked()}, now=NOW + fd.RECOVER_AFTER_SEC + 60)
+    c = cli.recover_calls[0]
+    assert c["cmd"][:2] == ["docker", "run"] and "-w" in c["cmd"] and c["cmd"][c["cmd"].index("-w") + 1] == "/app"
+    assert c["cmd"][c["cmd"].index("--entrypoint") + 1] == "node" and fd.DEFAULT_IMAGE in c["cmd"]
+    secret = c["env"]["FLOP_RECOVER_SECRET"]
+    assert secret.startswith("0x") and len(secret) == 66 and not any(secret in a for a in c["cmd"])
+    assert c["env"]["FLOP_RECOVER_RPC"] == "wss://testnet.flop.network" and c["env"]["FLOP_RECOVER_ADDR"] == ADDR
+    assert c["env"]["FLOP_RECOVER_CHANNELS"] == CH and "--input-type=module" in c["cmd"]
+    assert st[fd.KEY]["pending"][0]["rec_tx"] == "0xt1"
+
+
+def test_stuck_channel_is_timed_out_then_refund_frees_the_miner():
+    st = _settle_unknown({})
+    early = RecoverCLI()
+    step(st, early, explorer={CH2: _locked()}, now=NOW + 300)
+    assert early.recover_calls == []                                            # chưa tới RECOVER_AFTER_SEC
+    cli = RecoverCLI(recover={CH2: {"state": "open", "action": "timeout", "ok": True, "tx": "0xt1", "refunded": "1"}})
+    t1 = NOW + fd.RECOVER_AFTER_SEC + 60
+    r = step(st, cli, explorer={CH2: _locked()}, now=t1)
+    assert len(cli.recover_calls) == 1 and r["outcome"] == "hold_unknown"
+    again = RecoverCLI()
+    step(st, again, explorer={CH2: _locked()}, now=t1 + fd.RECOVER_RETRY_SEC + 60)
+    assert again.recover_calls == []                                            # đã gửi tx: không gửi lại
+    refunded = {**_locked(), "status": "timedout", "paymentStatus": "REFUNDED"}
+    cli2 = CLI()
+    step(st, cli2, explorer={CH2: refunded}, now=t1 + 600)
+    assert "unknown_until" not in mst(st) and len(cli2.sessions()) == 1         # hết giữ 6 giờ: miner dùng lại ngay
+    assert st[fd.KEY]["stats"]["refunded"] == 1
+
+
+def test_not_yet_due_on_chain_is_retried_later_without_counting_a_try():
+    st = _settle_unknown({})
+    cli = RecoverCLI(recover={CH2: {"state": "open", "action": "wait", "deadline": "999"}})
+    t1 = NOW + fd.RECOVER_AFTER_SEC + 60
+    step(st, cli, explorer={CH2: _locked()}, now=t1)
+    p = st[fd.KEY]["pending"][0]
+    assert len(cli.recover_calls) == 1 and p["rec_at"] == t1 and not p.get("rec_tries")
+    cli2 = RecoverCLI(recover={CH2: {"state": "open", "action": "wait"}})
+    step(st, cli2, explorer={CH2: _locked()}, now=t1 + 300)
+    assert cli2.recover_calls == []                                             # cách nhau RECOVER_RETRY_SEC
+
+
+def test_recover_failures_alert_after_max_tries():
+    st = _settle_unknown({})
+    t, alerts = NOW + fd.RECOVER_AFTER_SEC + 60, []
+    for _ in range(fd.RECOVER_MAX_TRIES + 1):
+        cli = RecoverCLI(recover={CH2: {"state": "open", "action": "timeout", "ok": False, "error": "boom"}})
+        step(st, cli, explorer={CH2: _locked()}, now=t, alerts=alerts)
+        t += fd.RECOVER_RETRY_SEC + 60
+    assert st[fd.KEY]["pending"][0]["rec_tries"] == fd.RECOVER_MAX_TRIES
+    assert sum("lấy lại escrow" in a for a in alerts) == 1
+
+
+def test_recover_waits_for_a_fresh_rpc_and_skips_local_cli(monkeypatch):
+    st = _settle_unknown({})
+    cli = RecoverCLI(recover={CH2: {"state": "open", "action": "timeout", "ok": True, "tx": "0xt"}})
+    step(st, cli, explorer={CH2: _locked()}, now=NOW + fd.RECOVER_AFTER_SEC + 60, rpc_ready_fn=lambda: "lệch 40s")
+    assert cli.recover_calls == []
+    monkeypatch.setenv("FLOP_DIRECT_CLI", "node /x/cli.js")
+    logs = []
+    assert fd.recover_channels([CH2], wkey=None, addr=ADDR, network="testnet", runner=cli, log=logs.append) == {}
+    assert cli.recover_calls == [] and logs
+
+
+def test_recover_script_is_shipped_and_only_calls_refund_extrinsics():
+    src = open(fd.RECOVER_SCRIPT, encoding="utf-8").read()
+    assert "client.timeout(id)" in src and "client.expireForceOpen(id)" in src
+    assert "secret is not the agent wallet" in src and '"foreign"' in src
+    for bad in ("forceSettle", "openChannel", "transfer", "settle(", "finalize("):
+        assert bad not in src
+
+
+def test_legacy_errored_channel_without_hold_mark_still_releases_its_session_hold():
+    st = _settle_unknown({})
+    st[fd.KEY]["pending"][0].pop("hold")                                        # bản ghi trước bản sửa
+    refunded = {**_locked(), "status": "timedout", "paymentStatus": "REFUNDED"}
+    cli = CLI()
+    step(st, cli, explorer={CH2: refunded}, now=NOW + 900)
+    assert "unknown_until" not in mst(st) and len(cli.sessions()) == 1
+
+
+# --- che seed trong log GitHub Actions ------------------------------------------------------------------------
+
+def test_seed_variants_cover_every_case_and_prefix():
+    h = "ab" * 31 + "Cd"
+    v = fd.seed_variants(h)
+    for x in (h, h.lower(), h.upper(), "0x" + h.lower(), "0x" + h.upper(), "0X" + h.lower()):
+        assert x in v
+    assert set(fd.seed_variants("0X" + h.upper())) >= {h.lower(), h.upper(), "0x" + h.lower()}  # mọi cách viết
+    assert fd.seed_variants("") == [] and fd.seed_variants("not-hex-secret") == ["not-hex-secret"]
+
+
+def test_actions_mask_prints_only_inside_github_actions(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    fd.actions_mask("supersecretvalue")
+    assert capsys.readouterr().out == ""                                          # cục bộ: in ra là lộ
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    fd.actions_mask("supersecretvalue", "", "short", "two" + chr(10) + "lines-secret")
+    assert capsys.readouterr().out.splitlines() == ["::add-mask::supersecretvalue"]
+
+
+def test_main_masks_seed_variants_before_anything_else(monkeypatch, capsys):
+    import agent_cron as ac
+    seed = "0F" * 32
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("AGENT_PRIVATE_KEY", seed)
+    monkeypatch.setenv("FLOP_WALLET_SEED_HEX", "")
+    ac.mask_seed_secrets()
+    masked = {l.split("::add-mask::", 1)[1] for l in capsys.readouterr().out.splitlines()}
+    assert {"0x" + seed.lower(), seed.lower(), seed, "0x" + seed} <= masked
+    src = open(ac.__file__, encoding="utf-8").read()
+    body = src[src.index("def main():"):]
+    assert body.index("mask_seed_secrets()") < body.index("print(")
+
+
+def test_keystore_password_is_masked(monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    cli = CLI()
+    step({}, cli)
+    pw = cli.calls[0]["env"][fd.PASSWORD_ENV]
+    assert f"::add-mask::{pw}" in capsys.readouterr().out
+
+
+def test_miner_with_recent_failures_counts_as_degraded():
+    # Còn PAID trong 3 giờ nhưng 3 kênh có kết cục gần nhất đều hỏng (hoàn tiền / khoá quá lâu) -> chỉ thăm dò.
+    rows = [_hch(fd.HEALTH_LOCKED_SEC + 60, "LOCKED"), _hch(2000, "REFUNDED"), _hch(2400, "REFUNDED"),
+            _hch(3000), _hch(3600)]
+    assert fd.miner_health(rows, NOW)[0] == "stale"
+    # Kênh còn khoá nhưng mới mở (chưa quá HEALTH_LOCKED_SEC) chưa tính là hỏng.
+    fresh = [_hch(300, "LOCKED"), _hch(2000, "REFUNDED"), _hch(2400, "REFUNDED"), _hch(3000)]
+    assert fd.miner_health(fresh, NOW)[0] == "ok"
+    # Có một kênh PAID mới nhất -> hồi lại ngay.
+    back = [_hch(100)] + rows
+    assert fd.miner_health(back, NOW)[0] == "ok"
+
+
+def test_fresh_paying_miners_take_turns_and_beat_older_ones(monkeypatch, three_miners):
+    # M2 và M3 đều vừa trả tiền (tươi) -> lần lượt; MINER còn "ok" nhưng PAID cuối đã cũ -> chỉ khi không còn miner tươi.
+    table = {MINER: [_hch(fd.HEALTH_FRESH_SEC + 600)], M2: [_hch(120)], M3: [_hch(300)]}
+    st, used = {}, []
+    for k in range(4):
+        cli = MultiCLI()
+        step(st, cli, offers_fn=_offers_for(MINER, M2, M3), miner_channels_fn=_health_fn(table), now=NOW + 600 * k)
+        used += cli.miners()
+    assert set(used[:2]) == {M2, M3} and used[2:] == used[:2] and MINER not in used
+    assert mst(st, M2)["last_used"] and mst(st, M3)["last_used"]
+
+
+def test_paced_run_stops_before_reading_miner_health(monkeypatch, three_miners):
+    # Đã cam kết đủ phần được phép tới giờ này -> dừng "paced"/"daily_cap" mà KHÔNG đọc explorer cho từng miner.
+    monkeypatch.setenv("FLOP_DIRECT_MAX_PER_DAY", "1")
+    seen = []
+    day = __import__("time").strftime("%Y-%m-%d", __import__("time").gmtime(NOW))
+    st = {fd.KEY: {"day": {"day": day, "escrow": 1.0}}}
+    cli = MultiCLI()
+    r = step(st, cli, offers_fn=_offers_for(MINER, M2, M3), miner_channels_fn=lambda m: seen.append(m) or [])
+    assert r["outcome"] in ("paced", "daily_cap") and seen == [] and cli.sessions() == []

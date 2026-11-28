@@ -420,6 +420,17 @@ jobs:
           # offer (mặc định) = chỉ dùng offer có chữ ký của miner. auto/force có thể mở kênh cưỡng bức (khoá
           # FLOP tới hạn nếu miner không xác nhận) -> cần thêm FLOP_DIRECT_ALLOW_FORCE=on.
           FLOP_DIRECT_VIA: ${{ vars.FLOP_DIRECT_VIA }}
+          # Mạng mua trực tiếp (testnet | devnet); trống = theo TESTNET_ENABLED. Thời hạn kênh (giây) cho --max-duration.
+          FLOP_DIRECT_NETWORK: ${{ vars.FLOP_DIRECT_NETWORK }}
+          FLOP_DIRECT_MAX_DURATION_SEC: ${{ vars.FLOP_DIRECT_MAX_DURATION_SEC }}
+          # RPC đọc nonce ví (gỡ sớm khoản giữ "không rõ kết quả"); trống = testnet.flop.network trên testnet.
+          FLOP_DIRECT_RPC_URL: ${{ vars.FLOP_DIRECT_RPC_URL }}
+          # Giới hạn chờ kết nối RPC của CLI (ms, `--rpc-timeout`); trống = 60000. CLI mặc định 10000 hụt khi testnet đông.
+          FLOP_DIRECT_RPC_TIMEOUT_MS: ${{ vars.FLOP_DIRECT_RPC_TIMEOUT_MS }}
+          # Chấm sức khoẻ miner qua explorer (mặc định bật; "off" = xoay vòng mù như cũ).
+          FLOP_DIRECT_HEALTH: ${{ vars.FLOP_DIRECT_HEALTH }}
+          # Id (tiền tố >= 12 hex) các kênh LỖI operator xác nhận chưa từng mở: bỏ theo dõi + gỡ chặn miner (chỉ khi explorer 404).
+          FLOP_DIRECT_FORGET: ${{ vars.FLOP_DIRECT_FORGET }}
           FLOP_DIRECT_ALLOW_FORCE: ${{ vars.FLOP_DIRECT_ALLOW_FORCE }}
           FLOP_DIRECT_DENY_MINERS: ${{ vars.FLOP_DIRECT_DENY_MINERS }}
           # Image CLI ghi đè: BẮT BUỘC ghim digest (…@sha256:<64 hex>) — container nhận khoá ví.
